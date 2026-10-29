@@ -1,0 +1,48 @@
+# Build Artifacts
+*.exe
+*.dll
+*.lib
+*.so
+*.dylib
+*.a
+*.exp
+*.o
+*.obj
+*.res
+
+# Target binary
+tkm
+tkmc
+
+# JIT Codegen intermediate outputs
+generated*.cu
+tkm_jit_kernels.cu
+*.ptx
+*.cubin
+*.optix
+
+# Model Weights & Checkpoints
+*.bin
+*.pt
+*.safetensors
+*.onnx
+
+# Profiling & Diagnostics (Nsight Systems / Compute)
+*.nsys-rep
+*.qdstrm
+*.ncu-rep
+*.log
+
+# Dataset folders
+data/
+data_kmnist/
+data_mnist/
+
+# IDE & Editor caches
+.vscode/
+.vs/
+*.sln
+*.vcxproj*
+.idea/
+*.swp
+*~

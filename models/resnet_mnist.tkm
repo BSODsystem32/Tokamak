@@ -1,0 +1,19 @@
+input: 28x28x1
+prng : wang_xorshift32   # 可隨時改為: xorshift32 | wang_xorshift32 | pcg32 | philox
+
+flow:
+  # 5 個獨立的空間與像素積木 -> 自動被 Fuse 成單一一個 NVRTC Kernel (PlasmaGroup #0)!
+  aug: RandShift(2) -> RandRotate(10.0) -> RandScale(0.10) -> RandElastic(1.6, r=4) -> RandNoise(0.03, prng=philox)
+
+  conv1: Conv(c=32, k=3, s=1, p=1) -> BN -> SiLU -> MixPool(2, ratio=0.85)
+  conv2: Conv(c=64, k=3, s=1, p=1) -> BN -> SiLU -> MixPool(2, ratio=0.85)
+
+  res3: {
+    branch: Conv(c=64, k=3, s=1, p=1) -> BN -> SiLU
+    skip  : Identity
+  } -> Add
+
+  head: Flatten -> {
+    gate: FC(512) -> SiLU
+    up  : FC(512)
+  } -> Mul -> LN -> SiLU -> Drop(0.2, prng=wang_xorshift32) -> FC(10) -> SoftmaxCE

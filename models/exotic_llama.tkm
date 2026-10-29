@@ -1,0 +1,24 @@
+input: 1x256x512
+prng : pcg32
+
+flow:
+  layer x 4: {
+    exotic_attn: {
+      branch: RMSNorm -> {
+        q: FC(512) -> QKNorm -> RoPE
+        k: FC(128) -> QKNorm -> RoPE
+        v: FC(128)
+      } -> GQA(q=8, kv=2, d=64) -> FC(512) -> SoftCap(50.0) -> LayerScale -> Drop(0.1)
+      skip: Identity
+    } -> Add
+
+    exotic_ffn: {
+      branch: RMSNorm -> {
+        gate: FC(1024) -> SoftCap(30.0) -> CosGate -> SiLU
+        up  : FC(1024) -> ReLU2
+      } -> Mul -> FC(512) -> DyT(0.5) -> Drop(0.1)
+      skip: Identity
+    } -> Add
+  }
+
+  head: RMSNorm -> FC(10) -> SoftmaxCE
