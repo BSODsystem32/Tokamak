@@ -1,6 +1,27 @@
 @echo off
 setlocal
 
+if defined INCLUDE goto :msvc_ready
+
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSWHERE%" (
+    for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL=%%i"
+)
+
+if not defined VS_INSTALL (
+    echo [Error] MSVC environment is not initialized and Visual Studio C++ tools were not found.
+    echo         Run this script from an x64 Native Tools Command Prompt for VS.
+    exit /b 1
+)
+
+echo [Tokamak] Initializing MSVC x64 build environment...
+call "%VS_INSTALL%\VC\Auxiliary\Build\vcvars64.bat" >nul
+if errorlevel 1 (
+    echo [Error] Failed to initialize the MSVC x64 build environment.
+    exit /b 1
+)
+
+:msvc_ready
 if "%ARCH%"=="" set ARCH=-arch=sm_86
 set FLAGS=-O3 -allow-unsupported-compiler -Xcompiler "/O2 /W3 /utf-8 /wd4819 /wd4996 /D_CRT_SECURE_NO_WARNINGS" -Xlinker "/STACK:8388608 /DELAYLOAD:nvcuda.dll" -ldelayimp -Iinclude
 
