@@ -107,7 +107,7 @@ tkm/
 ├── models/
 │   ├── resnet_mnist.tkm  # ResNet-CNN markup
 │   └── exotic_llama.tkm  # 4-Layer GQA + SwiGLU LLaMA markup
-├── build.bat             # Windows MSVC Build Script (Outputs tkm.exe & tkm.dll)
+├── build.bat             # Windows MSVC Build Script (CLI, DLL, and MNIST ABI example)
 ├── Makefile              # Linux GCC Build Script (Outputs tkm & libtkm.so)
 └── README.md
 ```
@@ -121,7 +121,7 @@ Open `x64 Native Tools Command Prompt for VS` and run:
 ```cmd
 build.bat
 ```
-This builds both **`tkm.exe`** (CLI executable with embedded icon) and **`tkm.dll` / `tkm.lib`** (shared library).
+This builds **`tkm.exe`** (CLI executable with an optional embedded icon), **`tkm.dll` / `tkm.lib`** (shared library), and **`mnist_idx.exe`** (standalone C ABI example).
 
 ### Linux (GCC + CUDA 11.6 ~ 13.x)
 ```bash

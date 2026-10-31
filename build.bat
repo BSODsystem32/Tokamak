@@ -22,7 +22,7 @@ if exist src\tkm.rc (
     set RES_FILE=
 )
 
-echo [Tokamak] 1/2 Building standalone executable tkm.exe...
+echo [Tokamak] 1/3 Building standalone executable tkm.exe...
 nvcc %FLAGS% %ARCH% ^
     src\tkm_registry.c ^
     src\tkm_core.c ^
@@ -38,7 +38,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [Tokamak] 2/2 Building shared library tkm.dll (+ tkm.lib)...
+echo [Tokamak] 2/3 Building shared library tkm.dll (+ tkm.lib)...
 nvcc --shared %FLAGS% -DTKM_BUILD_DLL %ARCH% ^
     src\tkm_registry.c ^
     src\tkm_core.c ^
@@ -52,5 +52,15 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
+echo [Tokamak] 3/3 Building MNIST IDX C ABI example mnist_idx.exe...
+cl.exe /nologo /O2 /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS /DTKM_USE_DLL /Iinclude ^
+    examples\mnist_idx.c tkm.lib ^
+    /Fe:mnist_idx.exe
+
+if %ERRORLEVEL% neq 0 (
+    echo [Error] mnist_idx.exe build failed!
+    exit /b 1
+)
+
 echo.
-echo [Success] Built both tkm.exe and tkm.dll (+ tkm.lib)!
+echo [Success] Built tkm.exe, tkm.dll (+ tkm.lib), and mnist_idx.exe!
