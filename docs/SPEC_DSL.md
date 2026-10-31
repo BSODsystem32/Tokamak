@@ -74,6 +74,8 @@ layer x 12: {
 
 ## 3. Built-In Operator Reference (All 42 Operators)
 
+Plasma operators and `MixPool` use CUDA `half2` kernels and require an even channel count. Graphs that violate this constraint are rejected during optimization with a shape error.
+
 | Category | Operator | Arguments & Defaults | Description |
 | :--- | :--- | :--- | :--- |
 | **Compute Anchors** | `Conv` | `c` (out channels), `k=3`, `s=1`, `p=0` | 2D Spatial Convolution (Direct Conv1 for $C_{in}=1$; Im2Col+GEMM for general) |
@@ -122,4 +124,3 @@ layer x 12: {
 | | `RoPE` | None | Rotary Position Embedding |
 | | `SoftmaxCE` | None | Fused Softmax Cross-Entropy Loss Sink |
 ```
-

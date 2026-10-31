@@ -333,6 +333,12 @@ static void build_group_abi(const TkmGraph *g, PlasmaGroup *pg) {
         return;
     }
 
+    if (pg->C % 2 != 0) {
+        fprintf(stderr, "[TKM Shape Error] PlasmaGroup #%d has odd channel count %d; CUDA half2 kernels require an even channel count.\n",
+                pg->id, pg->C);
+        exit(1);
+    }
+
     int rows = g->batch_size * pg->H * pg->W;
     int C2 = pg->C / 2;
     int rows_per_blk = (!pg->is_qkv_prep && C2 > 0 && C2 <= 32 && (256 % C2 == 0)) ? (256 / C2) : TKM_ROWS_PER_CTA;
@@ -362,6 +368,15 @@ void tkm_optimize_and_bind(TkmGraph *g) {
     const TkmFusionRule *rules = tkm_get_fusion_rules(&num_rules);
 
     tkm_infer_shapes(g);
+
+    for (int i = 0; i < g->num_nodes; i++) {
+        const TkmNode *n = &g->nodes[i];
+        if (!n->dead && n->op == OP_MIXPOOL && n->C % 2 != 0) {
+            fprintf(stderr, "[TKM Shape Error] MixPool node #%d (%s) has odd channel count %d; CUDA half2 kernels require an even channel count.\n",
+                    i, n->tag, n->C);
+            exit(1);
+        }
+    }
 
     for (int i = 0; i < g->num_nodes; i++) {
         if (g->nodes[i].dead) continue;

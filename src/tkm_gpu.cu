@@ -535,7 +535,7 @@ void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __r
 
 __global__ void k_softmax_ce_fwd_bwd_h(const __half * __restrict__ logits, const uint8_t * __restrict__ labels,
                                        __half * __restrict__ dlogits, float * __restrict__ loss_acc,
-                                       int * __restrict__ corr_acc, int rows, int cols, int is_eval) {
+                                       int * __restrict__ corr_acc, int rows, int cols, int is_eval, int valid_rows) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
     float mx = -1e30f;
@@ -547,7 +547,7 @@ __global__ void k_softmax_ce_fwd_bwd_h(const __half * __restrict__ logits, const
     float sum = 0.0f;
     for (int c = 0; c < cols; c++) sum += expf(__half2float(logits[r * cols + c]) - mx);
     int lbl = labels ? labels[r] : 0;
-    if (corr_acc && pred == lbl) atomicAdd(corr_acc, 1);
+    if (corr_acc && (!is_eval || r < valid_rows) && pred == lbl) atomicAdd(corr_acc, 1);
     if (is_eval) return;
 
     float inv_rows = 1.0f / (float)rows;
@@ -931,7 +931,7 @@ static void launch_plasma_sig(TkmRuntime *rt, CUfunction fn, const TkmKernelSig 
     CU_CHECK(cuLaunchKernel(fn, sig->grid_x, 1, 1, sig->block_x, 1, 1, 0, (CUstream)rt->stream, kargs, NULL));
 }
 
-static void execute_forward_pass(TkmRuntime *rt, int is_eval) {
+static void execute_forward_pass(TkmRuntime *rt, int is_eval, int valid_examples) {
     const TkmGraph *g = &rt->graph;
     int B = g->batch_size;
     int executed_grp[TKM_MAX_GROUPS] = {0};
@@ -1016,7 +1016,8 @@ static void execute_forward_pass(TkmRuntime *rt, int is_eval) {
                 void *dout_ptr = rt->d_grad_arena + g->nodes[n->in0].out_offset;
                 k_softmax_ce_fwd_bwd_h<<<(rows + 255) / 256, 256, 0, rt->stream>>>(
                     (const __half*)in_ptr, rt->d_labels, (__half*)dout_ptr,
-                    rt->d_loss_buf, rt->d_corr_buf, rows, n->C, is_eval);
+                    rt->d_loss_buf, rt->d_corr_buf, rows, n->C, is_eval,
+                    is_eval ? (valid_examples * rows + B - 1) / B : rows);
                 break;
             }
             default: break;
@@ -1036,7 +1037,7 @@ static void record_full_step_stream(TkmRuntime *rt) {
         }
     }
 
-    execute_forward_pass(rt, 0);
+    execute_forward_pass(rt, 0, B);
 
     int executed_grp[TKM_MAX_GROUPS] = {0};
     for (int i = g->num_nodes - 1; i >= 1; i--) {
@@ -1199,7 +1200,7 @@ float tkm_runtime_step(TkmRuntime *rt, const float *h_input, const uint8_t *h_la
 /* Evaluate single scalar loss of current state on GPU */
 float tkm_eval_current_loss(TkmRuntime *rt) {
     CUDA_CHECK(cudaMemsetAsync(rt->d_loss_buf, 0, sizeof(float), rt->stream));
-    execute_forward_pass(rt, 0);
+    execute_forward_pass(rt, 0, rt->graph.batch_size);
     float l = 0.0f;
     CUDA_CHECK(cudaMemcpyAsync(&l, rt->d_loss_buf, sizeof(float), cudaMemcpyDeviceToHost, rt->stream));
     CUDA_CHECK(cudaStreamSynchronize(rt->stream));
@@ -1223,18 +1224,34 @@ float tkm_get_grad_sample(TkmRuntime *rt, int node_id, int elem_idx) {
 }
 
 int tkm_runtime_eval(TkmRuntime *rt, const float *h_input, const uint8_t *h_labels, int count) {
+    if (!rt || !h_input || !h_labels || count <= 0) return 0;
+
     int B = rt->graph.batch_size;
+    if (B <= 0) return 0;
     int in_elems = B * rt->graph.nodes[0].H * rt->graph.nodes[0].W * rt->graph.nodes[0].C;
+    int elems_per_example = in_elems / B;
     int total_correct = 0;
 
     CUDA_CHECK(cudaMemsetAsync(rt->d_corr_buf, 0, sizeof(int), rt->stream));
-    for (int offset = 0; offset + B <= count; offset += B) {
-        CUDA_CHECK(cudaMemcpyAsync(rt->d_input_f32, h_input + (size_t)offset * (in_elems / B),
-                                   (size_t)in_elems * sizeof(float), cudaMemcpyHostToDevice, rt->stream));
+    for (int offset = 0; offset < count; offset += B) {
+        int valid_examples = (count - offset < B) ? count - offset : B;
+        size_t valid_elems = (size_t)valid_examples * elems_per_example;
+        size_t batch_bytes = (size_t)in_elems * sizeof(float);
+        size_t valid_bytes = valid_elems * sizeof(float);
+        CUDA_CHECK(cudaMemcpyAsync(rt->d_input_f32, h_input + (size_t)offset * elems_per_example,
+                                   valid_bytes, cudaMemcpyHostToDevice, rt->stream));
+        if (valid_bytes < batch_bytes) {
+            CUDA_CHECK(cudaMemsetAsync((char*)rt->d_input_f32 + valid_bytes, 0,
+                                       batch_bytes - valid_bytes, rt->stream));
+        }
         k_f32_to_f16<<<(in_elems + 255) / 256, 256, 0, rt->stream>>>(
             rt->d_input_f32, (__half*)(rt->d_arena + rt->graph.nodes[0].out_offset), in_elems);
-        CUDA_CHECK(cudaMemcpyAsync(rt->d_labels, h_labels + offset, (size_t)B * sizeof(uint8_t), cudaMemcpyHostToDevice, rt->stream));
-        execute_forward_pass(rt, 1);
+        CUDA_CHECK(cudaMemcpyAsync(rt->d_labels, h_labels + offset, (size_t)valid_examples * sizeof(uint8_t), cudaMemcpyHostToDevice, rt->stream));
+        if (valid_examples < B) {
+            CUDA_CHECK(cudaMemsetAsync(rt->d_labels + valid_examples, 0,
+                                       (size_t)(B - valid_examples) * sizeof(uint8_t), rt->stream));
+        }
+        execute_forward_pass(rt, 1, valid_examples);
     }
     CUDA_CHECK(cudaMemcpyAsync(&total_correct, rt->d_corr_buf, sizeof(int), cudaMemcpyDeviceToHost, rt->stream));
     CUDA_CHECK(cudaStreamSynchronize(rt->stream));

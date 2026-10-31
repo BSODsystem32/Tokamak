@@ -5,9 +5,19 @@ if "%ARCH%"=="" set ARCH=-arch=sm_86
 set FLAGS=-O3 -allow-unsupported-compiler -Xcompiler "/O2 /W3 /utf-8 /wd4819 /wd4996 /D_CRT_SECURE_NO_WARNINGS" -Xlinker "/STACK:8388608 /DELAYLOAD:nvcuda.dll" -ldelayimp -Iinclude
 
 if exist src\tkm.rc (
-    echo [Tokamak] Embedding tkm.ico into Windows resource...
-    rc.exe /nologo src\tkm.rc
-    set RES_FILE=src\tkm.res
+    where rc.exe >nul 2>nul
+    if not errorlevel 1 (
+        echo [Tokamak] Embedding tkm.ico into Windows resource...
+        rc.exe /nologo src\tkm.rc
+        if errorlevel 1 (
+            echo [Error] Resource compilation failed!
+            exit /b 1
+        )
+        set RES_FILE=src\tkm.res
+    ) else (
+        echo [Tokamak] rc.exe not found; building without the optional icon resource.
+        set RES_FILE=
+    )
 ) else (
     set RES_FILE=
 )

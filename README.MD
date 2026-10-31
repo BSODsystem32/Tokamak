@@ -96,6 +96,8 @@ flow:
 tkm/
 ├── include/
 │   └── tkm.h             # Core IR, Unified ABI Signature table & Public C APIs
+├── examples/
+│   └── mnist_idx.c       # External C ABI caller using raw MNIST IDX files
 ├── src/
 │   ├── tkm_registry.c    # [Contributor Hub] All 42 Operator Specs & Fusion Rules live here!
 │   ├── tkm_core.c        # DSL Parser, Loop Macro Expander, Shape Inference & Arena Planner
@@ -125,6 +127,7 @@ This builds both **`tkm.exe`** (CLI executable with embedded icon) and **`tkm.dl
 ```bash
 make -j
 ```
+This builds the CLI and `libtkm.so`; build the external MNIST IDX caller with `make mnist_idx`.
 
 ---
 
@@ -176,28 +179,30 @@ tkm.exe inspect models/exotic_llama.tkm --batch 32 --emit generated_llama.cu
 
 ## 🔌 Public C / C++ Library API
 
-You can embed Tokamak into any host application (C, C++, or Python via `ctypes`) using the clean API exported in `tkm.dll` / `libtkm.so`:
+You can embed Tokamak into any host application using the exported API. The caller only includes `tkm.h` and passes ordinary host pointers; it does not need CUDA headers or CUDA types. `examples/mnist_idx.c` is a complete MNIST IDX caller that trains `models/resnet_mnist.tkm` and evaluates on the IDX test set.
 
 ```c
 #include "tkm.h"
 
 int main() {
-    // 1. Load markup model and JIT compile to GPU
-    TkmRuntime *rt = tkm_load_file("models/exotic_llama.tkm", /*batch_size=*/32);
-
-    // 2. Training Loop (Full Fwd+Bwd+SGD locked inside single CUDA Graph!)
-    for (int step = 0; step < 1000; step++) {
-        float loss = tkm_runtime_step(rt, d_input, d_labels, /*lr=*/1e-3f);
-    }
-
-    // 3. Evaluation Mode (Auto-bypasses Coordinate Augmentations & Dropouts)
-    int correct = tkm_runtime_eval(rt, d_test_input, d_test_labels, /*count=*/10000);
-
-    // 4. Checkpointing
+    TkmRuntime *rt = tkm_load_file("models/resnet_mnist.tkm", 64);
+    if (!rt) return 1;
+    float host_images[64 * 28 * 28] = {0};
+    uint8_t host_labels[64] = {0};
+    float loss = tkm_runtime_step(rt, host_images, host_labels, 1e-3f);
+    (void)loss;
     tkm_save_weights(rt, "checkpoint.bin");
     tkm_runtime_free(rt);
 }
 ```
+
+Build the example caller with `cl /O2 /Iinclude /DTKM_USE_DLL examples\mnist_idx.c tkm.lib` on Windows or `make mnist_idx` on Linux. Keep `tkm.dll`/`libtkm.so`, the model file, and CUDA runtime dependencies available when launching the caller. The IDX example accepts the standard uncompressed IDX image and label files; decompress the usual `.gz` downloads before running it:
+
+```text
+mnist_idx train-images-idx3-ubyte train-labels-idx1-ubyte t10k-images-idx3-ubyte t10k-labels-idx1-ubyte [batch=64] [epochs=1]
+```
+
+`tkm_runtime_eval` accepts any positive sample count and excludes padded rows in a final partial batch. Plasma operators and `MixPool` use CUDA `half2` kernels and therefore require even channel counts.
 
 ---
 
@@ -228,4 +233,3 @@ Simply add one entry to `TKM_OP_REGISTRY[]`:
 }
 ```
 Recompile with `build.bat` or `make`. Your new operator is now instantly available in `.tkm` DSL, mathematically auditable via `tkm.exe numcheck`, and fuses with arbitrary surrounding blocks!
-
