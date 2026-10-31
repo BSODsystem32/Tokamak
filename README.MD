@@ -98,6 +98,8 @@ tkm/
 │   └── tkm.h             # Core IR, Unified ABI Signature table & Public C APIs
 ├── examples/
 │   └── mnist_idx.c       # External C ABI caller using raw MNIST IDX files
+├── docs/
+│   └── C_API.md          # Host-side C ABI and MNIST IDX walkthrough
 ├── src/
 │   ├── tkm_registry.c    # [Contributor Hub] All 42 Operator Specs & Fusion Rules live here!
 │   ├── tkm_core.c        # DSL Parser, Loop Macro Expander, Shape Inference & Arena Planner
@@ -196,11 +198,13 @@ int main() {
 }
 ```
 
-Build the example caller with `cl /O2 /Iinclude /DTKM_USE_DLL examples\mnist_idx.c tkm.lib` on Windows or `make mnist_idx` on Linux. Keep `tkm.dll`/`libtkm.so`, the model file, and CUDA runtime dependencies available when launching the caller. The IDX example accepts the standard uncompressed IDX image and label files; decompress the usual `.gz` downloads before running it:
+Build the example caller with `build.bat` on Windows or `make mnist_idx` on Linux. Keep `tkm.dll`/`libtkm.so`, the model file, and CUDA runtime dependencies available when launching the caller. The IDX example accepts the standard uncompressed IDX image and label files; decompress the usual `.gz` downloads before running it:
 
 ```text
 mnist_idx train-images-idx3-ubyte train-labels-idx1-ubyte t10k-images-idx3-ubyte t10k-labels-idx1-ubyte [batch=64] [epochs=1]
 ```
+
+With batch size 1024 and 30 epochs, one run reported train loss `0.1206` and test accuracy `9846/10000 (98.46%)`; this is an observed result, not a guarantee. Training uses complete fixed-size batches, so the example reports and skips any leftover training samples. See [docs/C_API.md](docs/C_API.md) for the full ABI walkthrough and command example.
 
 `tkm_runtime_eval` accepts any positive sample count and excludes padded rows in a final partial batch. Plasma operators and `MixPool` use CUDA `half2` kernels and therefore require even channel counts.
 
