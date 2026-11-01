@@ -47,7 +47,7 @@ jobs:
           mkdir -p dist-sdk/include dist-sdk/lib
           cp include/tkm.h dist-sdk/include/
           cp libtkm.a dist-sdk/lib/
-          cp -L /usr/local/cuda-12.6/lib64/lib{cudart,nvrtc,nvrtc-builtins,cublas,cublasLt}.so* dist-sdk/lib/
+          cp -a /usr/local/cuda-12.6/lib64/lib{cudart,nvrtc,nvrtc-builtins,cublas,cublasLt}.so* dist-sdk/lib/
           cp -L /usr/local/cuda-12.6/lib64/stubs/libcuda.so dist-sdk/lib/
           gcc -O2 -I dist-sdk/include examples/mnist_idx.c dist-sdk/lib/libtkm.a \
             -L dist-sdk/lib -lcudart -lnvrtc -lcuda -lcublas -lcublasLt \
