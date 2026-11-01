@@ -123,13 +123,13 @@ Open `x64 Native Tools Command Prompt for VS` and run:
 ```cmd
 build.bat
 ```
-This builds **`tkm.exe`** (CLI executable with an optional embedded icon), **`tkm.dll` / `tkm.lib`** (shared library), and **`mnist_idx.exe`** (standalone C ABI example).
+This builds **`tkm.exe`** (CLI executable with an optional embedded icon), **`tkm.dll` / `tkm.lib`** (shared library and import library), **`tkm_static.lib`** (static SDK library), and C ABI examples linked against both library types.
 
 ### Linux (GCC + CUDA 11.6 ~ 13.x)
 ```bash
 make -j
 ```
-This builds the CLI and `libtkm.so`; build the external MNIST IDX caller with `make mnist_idx`.
+This builds the CLI, `libtkm.so`, and `libtkm.a`. Build the dynamic and static MNIST IDX callers with `make mnist_idx` and `make mnist_idx_static`, respectively.
 
 ---
 
@@ -182,6 +182,8 @@ tkm.exe inspect models/exotic_llama.tkm --batch 32 --emit generated_llama.cu
 ## 🔌 Public C / C++ Library API
 
 You can embed Tokamak into any host application using the exported API. The caller only includes `tkm.h` and passes ordinary host pointers; it does not need CUDA headers or CUDA types. `examples/mnist_idx.c` is a complete MNIST IDX caller that trains `models/resnet_mnist.tkm` and evaluates on the IDX test set.
+
+Release downloads provide independent choices: the executable/runtime bundle (`tkm-windows-x64.zip` or `tkm-linux-x64.tar.gz`) for users who want the CLI and model files, and a static SDK bundle (`tkm-sdk-windows-x64.zip` or `tkm-sdk-linux-x64.tar.gz`) for embedding Tokamak into a host application. The SDK includes `include/tkm.h`, the platform static library, the minimal CUDA runtime/NVRTC/cuBLAS libraries, and the link libraries needed by the host compiler; it does not require the full CUDA Toolkit to build or run the host application. An NVIDIA driver is still required at runtime. See [docs/C_API.md](docs/C_API.md) for link commands and deployment details.
 
 ```c
 #include "tkm.h"
