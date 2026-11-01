@@ -655,11 +655,32 @@ static void apply_qkv_3way_rule(TkmGraph *g, int nid) {
     trace_fc_chain(g, n->in1, &kf, kc, &kl);
     trace_fc_chain(g, n->in2, &vf, vc, &vl);
 
-    int has_qkn = 0, has_rp = 0;
+    int q_has_qkn = 0, k_has_qkn = 0;
+    const TkmNode *q_rope_cfg = NULL, *k_rope_cfg = NULL;
     for (int m = 0; m < ql; m++) {
-        if (g->nodes[qc[m]].op == OP_QKNORM) has_qkn = 1;
-        if (g->nodes[qc[m]].op == OP_ROPE)   has_rp = 1;
+        if (g->nodes[qc[m]].op == OP_QKNORM) q_has_qkn = 1;
+        if (g->nodes[qc[m]].op == OP_ROPE) q_rope_cfg = &g->nodes[qc[m]];
     }
+    for (int m = 0; m < kl; m++) {
+        if (g->nodes[kc[m]].op == OP_QKNORM) k_has_qkn = 1;
+        if (g->nodes[kc[m]].op == OP_ROPE) k_rope_cfg = &g->nodes[kc[m]];
+    }
+    if (q_has_qkn != k_has_qkn ||
+        (q_rope_cfg == NULL) != (k_rope_cfg == NULL) ||
+        (q_rope_cfg && (q_rope_cfg->rope_theta != k_rope_cfg->rope_theta ||
+                        q_rope_cfg->rope_scale != k_rope_cfg->rope_scale ||
+                        q_rope_cfg->rope_low_freq_factor != k_rope_cfg->rope_low_freq_factor ||
+                        q_rope_cfg->rope_high_freq_factor != k_rope_cfg->rope_high_freq_factor ||
+                        q_rope_cfg->rope_original_context_length != k_rope_cfg->rope_original_context_length))) {
+        fprintf(stderr, "[TKM Shape Error] Fused GQA requires matching Q/K QKNorm and RoPE configurations.\n");
+        exit(1);
+    }
+    if (q_has_qkn && n->head_dim != 64) {
+        fprintf(stderr, "[TKM Shape Error] QKNorm currently supports 64-dimensional GQA heads only.\n");
+        exit(1);
+    }
+    int has_qkn = q_has_qkn, has_rp = q_rope_cfg != NULL;
+    const TkmNode *rope_cfg = q_rope_cfg;
 
     TkmNode *fq = &g->nodes[qf], *fk = &g->nodes[kf], *fv = &g->nodes[vf];
     int tot = fq->c_out + fk->c_out + fv->c_out;
@@ -685,6 +706,13 @@ static void apply_qkv_3way_rule(TkmGraph *g, int nid) {
     prep->c_out = tot;
     prep->q_heads = n->q_heads; prep->kv_heads = n->kv_heads; prep->head_dim = n->head_dim;
     prep->has_qknorm = has_qkn; prep->has_rope = has_rp;
+    if (rope_cfg) {
+        prep->rope_theta = rope_cfg->rope_theta;
+        prep->rope_scale = rope_cfg->rope_scale;
+        prep->rope_low_freq_factor = rope_cfg->rope_low_freq_factor;
+        prep->rope_high_freq_factor = rope_cfg->rope_high_freq_factor;
+        prep->rope_original_context_length = rope_cfg->rope_original_context_length;
+    }
     snprintf(prep->tag, sizeof(prep->tag), "qkv_prep_%d", prep->id);
     snprintf(fq->tag, sizeof(fq->tag), "qkv3x_gemm_%d", fq->id);
 

@@ -80,7 +80,7 @@ Plasma operators and `MixPool` use CUDA `half2` kernels and require an even chan
 | :--- | :--- | :--- | :--- |
 | **Compute Anchors** | `Conv` | `c` (out channels), `k=3`, `s=1`, `p=0` | 2D Spatial Convolution (Direct Conv1 for $C_{in}=1$; Im2Col+GEMM for general) |
 | | `FC` | `c` / positional (out features) | Fully Connected Linear Layer (Tensor Core GEMM) |
-| | `GQA` | `q=8`, `kv=2`, `d=64` | Hardware WMMA Tensor Core Grouped-Query FlashAttention-2 |
+| | `GQA` | `q=8`, `kv=2`, `d=64`, `causal=false` | WMMA Tensor Core Grouped-Query FlashAttention-2 (`d=64` or `128`; set `causal=true` for decoder attention) |
 | **Spatial Transform** | `MixPool` | `k=2`, `ratio=0.85` | Mixed Anti-Aliased 2x2 Pooling: `ratio*Max + (1-ratio)*Avg` |
 | | `AvgPool` | `k=2` | Standard 2x2 Average Pooling |
 | | `Flatten` | None | Flattens $[H, W, C]$ to $[1, 1, H \cdot W \cdot C]$ |
@@ -127,7 +127,7 @@ Plasma operators and `MixPool` use CUDA `half2` kernels and require an even chan
 | | `PReLU` | `init=0.25` | Learnable per-channel parametric negative slope |
 | | `xATLU` | `init=0.5` | Learnable gated interpolation between Linear and SiLU |
 | | `Drop` | `p=0.1` | In-Register Dropout with bitmask storage |
-| | `RoPE` | None | Rotary Position Embedding |
+| | `RoPE` | `theta=10000`, `scale=1` | Rotary Position Embedding; `scale>1` enables LLaMA 3 frequency interpolation, with optional `low_freq_factor`, `high_freq_factor`, and `original_context_length` (defaults `1`, `4`, and `8192`) |
 ```
 
 `SoftmaxCE`, `SoftmaxFocal`, and `SoftmaxMSE` are terminal training-loss operators

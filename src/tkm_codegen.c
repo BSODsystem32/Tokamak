@@ -40,6 +40,35 @@ static void sb_printf(StrBuf *sb, const char *fmt, ...) {
     sb->len += (size_t)need;
 }
 
+static void emit_rope_rotation(StrBuf *sb, const TkmNode *n, int inverse) {
+    int hd = n->head_dim > 0 ? n->head_dim : 64;
+    sb_printf(sb, "                float inv_freq = __expf(-logf(%.9ff) * (float)lane / %d.0f);\n",
+              n->rope_theta, hd);
+    if (n->rope_scale > 1.0f) {
+        sb_printf(sb,
+                  "                float wavelen = 6.283185307179586f / inv_freq;\n"
+                  "                float low_wavelen = %.9ff / %.9ff;\n"
+                  "                float high_wavelen = %.9ff / %.9ff;\n"
+                  "                if (wavelen > low_wavelen) inv_freq /= %.9ff;\n"
+                  "                else if (wavelen >= high_wavelen) {\n"
+                  "                    float smooth = (%.9ff / wavelen - %.9ff) / (%.9ff - %.9ff);\n"
+                  "                    inv_freq *= 1.0f - smooth * (1.0f - 1.0f / %.9ff);\n"
+                  "                }\n",
+                  n->rope_original_context_length, n->rope_low_freq_factor,
+                  n->rope_original_context_length, n->rope_high_freq_factor,
+                  n->rope_scale, n->rope_original_context_length,
+                  n->rope_low_freq_factor, n->rope_high_freq_factor,
+                  n->rope_low_freq_factor, n->rope_scale);
+    }
+    sb_printf(sb, "                float freq = (float)pos * inv_freq;\n");
+    sb_printf(sb, "                float sf, cf; __sincosf(freq, &sf, &cf);\n");
+    if (inverse) {
+        sb_printf(sb, "                dy = make_float2(dy.x * cf + dy.y * sf, -dy.x * sf + dy.y * cf);\n");
+    } else {
+        sb_printf(sb, "                v = make_float2(v.x * cf - v.y * sf, v.x * sf + v.y * cf);\n");
+    }
+}
+
 static const char *cuda_math_name(const char *name) {
     if (!strcmp(name, "exp")) return "expf";
     if (!strcmp(name, "log") || !strcmp(name, "ln")) return "logf";
@@ -184,9 +213,8 @@ static void emit_qkv_prep_plasma_group(const TkmGraph *g, const PlasmaGroup *pg,
     if (n->has_rope) {
         sb_printf(sb, "            if (active && tid < %d) {\n", qk_c2);
         sb_printf(sb, "                int lane = tid & %d;\n", hd2 - 1);
-        sb_printf(sb, "                float freq = (float)pos * __expf(-0.1440425f * (float)lane);\n");
-        sb_printf(sb, "                float sf, cf; __sincosf(freq, &sf, &cf);\n");
-        sb_printf(sb, "                v = make_float2(v.x * cf - v.y * sf, v.x * sf + v.y * cf);\n            }\n");
+        emit_rope_rotation(sb, n, 0);
+        sb_printf(sb, "            }\n");
     }
     sb_printf(sb, "            if (active) out_0[idx2] = __float22half2_rn(v);\n        }\n    }\n}\n\n");
 
@@ -207,9 +235,8 @@ static void emit_qkv_prep_plasma_group(const TkmGraph *g, const PlasmaGroup *pg,
     if (n->has_rope) {
         sb_printf(sb, "            if (active && tid < %d) {\n", qk_c2);
         sb_printf(sb, "                int lane = tid & %d;\n", hd2 - 1);
-        sb_printf(sb, "                float freq = (float)pos * __expf(-0.1440425f * (float)lane);\n");
-        sb_printf(sb, "                float sf, cf; __sincosf(freq, &sf, &cf);\n");
-        sb_printf(sb, "                dy = make_float2(dy.x * cf + dy.y * sf, -dy.x * sf + dy.y * cf);\n            }\n");
+        emit_rope_rotation(sb, n, 1);
+        sb_printf(sb, "            }\n");
     }
     if (n->has_qknorm) {
         sb_printf(sb, "            float2 xh = (active && tid < %d) ? __half22float2(__ldg(&save_xhat_%d[idx2])) : make_float2(0.f, 0.f);\n", qk_c2, n->id);

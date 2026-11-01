@@ -28,12 +28,12 @@
 extern "C" {
 #endif
 
-#define TKM_MAX_NODES   512
-#define TKM_MAX_GROUPS  128
-#define TKM_MAX_BUFFERS 256
+#define TKM_MAX_NODES   1024
+#define TKM_MAX_GROUPS  256
+#define TKM_MAX_BUFFERS 512
 #define TKM_MAX_CHAIN   8
 #define TKM_MAX_KARGS   28
-#define TKM_MAX_TENSORS 256
+#define TKM_MAX_TENSORS 512
 
 typedef enum {
     RNG_DEFAULT = 0,
@@ -135,10 +135,12 @@ typedef struct {
     int        c_out, k, s, p;
     int        q_c, k_c, v_c;
     int        q_heads, kv_heads, head_dim;
-    int        has_qknorm, has_rope;
+    int        has_qknorm, has_rope, causal;
     int        qkv_prep_nid;
     float      fval;
     float      fval2;
+    float      rope_theta, rope_scale, rope_low_freq_factor, rope_high_freq_factor;
+    float      rope_original_context_length;
     TkmRngType rng_type;
 
     int        left_nodes[TKM_MAX_CHAIN];
@@ -213,6 +215,7 @@ TKM_API TkmRuntime *tkm_load_file(const char *tkm_path, int batch_size);
 TKM_API TkmRuntime *tkm_load_string(const char *dsl_text, int batch_size);
 TKM_API float       tkm_runtime_step(TkmRuntime *rt, const float *h_input, const uint8_t *h_labels, float lr);
 TKM_API int         tkm_runtime_eval(TkmRuntime *rt, const float *h_input, const uint8_t *h_labels, int count);
+TKM_API size_t      tkm_runtime_forward(TkmRuntime *rt, const float *h_input, float *h_output, size_t output_capacity);
 TKM_API int         tkm_save_weights(TkmRuntime *rt, const char *bin_path);
 TKM_API int         tkm_load_weights(TkmRuntime *rt, const char *bin_path);
 TKM_API void        tkm_runtime_free(TkmRuntime *rt);
