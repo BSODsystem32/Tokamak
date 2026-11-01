@@ -9,6 +9,7 @@
  *   4. Full-Step CUDA Graph Capture + Weight Save/Load & External Eval API
  */
 #include "tkm.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -1222,29 +1223,58 @@ static void record_full_step_stream(TkmRuntime *rt) {
 }
 
 TkmRuntime *tkm_load_string(const char *dsl_text, int batch_size) {
+    if (!dsl_text || batch_size <= 0) return NULL;
+    return tkm_load_buffer(dsl_text, strlen(dsl_text), batch_size);
+}
+
+TkmRuntime *tkm_load_buffer(const char *dsl_data, size_t dsl_size, int batch_size) {
+    if (!dsl_data || dsl_size == 0 || batch_size <= 0 || dsl_size > SIZE_MAX - 1) return NULL;
     TkmGraph *g = (TkmGraph*)calloc(1, sizeof(TkmGraph));
+    if (!g) return NULL;
+    char *dsl_text = (char*)malloc(dsl_size + 1);
+    if (!dsl_text) {
+        free(g);
+        return NULL;
+    }
+    memcpy(dsl_text, dsl_data, dsl_size);
+    dsl_text[dsl_size] = '\0';
     tkm_parse_dsl(g, dsl_text, batch_size);
     tkm_optimize_and_bind(g);
     tkm_plan_memory(g);
     char *cuda_src = tkm_codegen_cuda_string(g);
     TkmRuntime *rt = tkm_runtime_ignite(g, cuda_src);
     free(cuda_src);
+    free(dsl_text);
     free(g);
     return rt;
 }
 
 TkmRuntime *tkm_load_file(const char *tkm_path, int batch_size) {
+    if (!tkm_path || batch_size <= 0) return NULL;
     FILE *f = fopen(tkm_path, "rb");
     if (!f) { perror(tkm_path); return NULL; }
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *dsl = (char*)malloc((size_t)sz + 1);
-    if (fread(dsl, 1, (size_t)sz, f) != (size_t)sz) { free(dsl); fclose(f); return NULL; }
-    dsl[sz] = '\0';
+    if (sz <= 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *dsl = (char*)malloc((size_t)sz);
+    if (!dsl) {
+        fclose(f);
+        return NULL;
+    }
+    if (fread(dsl, 1, (size_t)sz, f) != (size_t)sz) {
+        free(dsl);
+        fclose(f);
+        return NULL;
+    }
     fclose(f);
 
-    TkmRuntime *rt = tkm_load_string(dsl, batch_size);
+    TkmRuntime *rt = tkm_load_buffer(dsl, (size_t)sz, batch_size);
     free(dsl);
     return rt;
 }
@@ -1402,38 +1432,84 @@ int tkm_runtime_eval(TkmRuntime *rt, const float *h_input, const uint8_t *h_labe
 
 #define TKM_WEIGHT_MAGIC 0x544B4D31u
 
-int tkm_save_weights(TkmRuntime *rt, const char *bin_path) {
-    CUDA_CHECK(cudaStreamSynchronize(rt->stream));
-    FILE *f = fopen(bin_path, "wb");
-    if (!f) { perror(bin_path); return 0; }
-    uint32_t magic = TKM_WEIGHT_MAGIC, nt = (uint32_t)rt->h_sgd.count;
-    fwrite(&magic, sizeof(uint32_t), 1, f);
-    fwrite(&nt,    sizeof(uint32_t), 1, f);
+size_t tkm_runtime_input_elements(const TkmRuntime *rt) {
+    if (!rt || rt->graph.batch_size <= 0 || rt->graph.num_nodes <= 0) return 0;
+    const TkmNode *input = &rt->graph.nodes[0];
+    return (size_t)rt->graph.batch_size * input->H * input->W * input->C;
+}
+
+size_t tkm_runtime_output_elements(const TkmRuntime *rt) {
+    if (!rt || rt->graph.batch_size <= 0) return 0;
+    for (int i = rt->graph.num_nodes - 1; i >= 0; i--) {
+        const TkmNode *node = &rt->graph.nodes[i];
+        if (!node->dead) {
+            if (node->op == OP_SOFTMAX_CE || node->op == OP_SOFTMAX_FOCAL ||
+                node->op == OP_SOFTMAX_MSE) return 0;
+            return (size_t)rt->graph.batch_size * node->H * node->W * node->C;
+        }
+    }
+    return 0;
+}
+
+size_t tkm_runtime_weight_bytes(const TkmRuntime *rt) {
+    if (!rt || rt->h_sgd.count < 0 || rt->h_sgd.count > UINT32_MAX) return 0;
+    size_t bytes = 2 * sizeof(uint32_t);
     for (int i = 0; i < rt->h_sgd.count; i++) {
-        int n = rt->h_sgd.size[i];
-        fwrite(&n, sizeof(int), 1, f);
+        if (rt->h_sgd.size[i] < 0 ||
+            bytes > SIZE_MAX - sizeof(uint32_t) ||
+            (size_t)rt->h_sgd.size[i] > (SIZE_MAX - bytes - sizeof(uint32_t)) / sizeof(float)) {
+            return 0;
+        }
+        bytes += sizeof(uint32_t) + (size_t)rt->h_sgd.size[i] * sizeof(float);
+    }
+    return bytes;
+}
+
+int tkm_save_weights_buffer(TkmRuntime *rt, void *buffer, size_t capacity, size_t *out_size) {
+    if (out_size) *out_size = 0;
+    if (!rt) return 0;
+    size_t required = tkm_runtime_weight_bytes(rt);
+    if (required == 0) return 0;
+    if (out_size) *out_size = required;
+    if (!buffer || capacity < required) return 0;
+
+    CUDA_CHECK(cudaStreamSynchronize(rt->stream));
+    uint8_t *dst = (uint8_t*)buffer;
+    uint32_t magic = TKM_WEIGHT_MAGIC, nt = (uint32_t)rt->h_sgd.count;
+    memcpy(dst, &magic, sizeof(magic)); dst += sizeof(magic);
+    memcpy(dst, &nt, sizeof(nt)); dst += sizeof(nt);
+    for (int i = 0; i < rt->h_sgd.count; i++) {
+        uint32_t n = (uint32_t)rt->h_sgd.size[i];
+        memcpy(dst, &n, sizeof(n)); dst += sizeof(n);
         float *h = (float*)malloc((size_t)n * sizeof(float));
+        if (n > 0 && !h) return 0;
         CUDA_CHECK(cudaMemcpy(h, rt->h_sgd.master[i], (size_t)n * sizeof(float), cudaMemcpyDeviceToHost));
-        fwrite(h, sizeof(float), (size_t)n, f);
+        memcpy(dst, h, (size_t)n * sizeof(float));
+        dst += (size_t)n * sizeof(float);
         free(h);
     }
-    fclose(f);
-    printf("  [TKM I/O] Saved %d learnable tensors (%d params) to '%s'\n",
-           rt->h_sgd.count, rt->total_sgd_elems, bin_path);
     return 1;
 }
 
-int tkm_load_weights(TkmRuntime *rt, const char *bin_path) {
-    FILE *f = fopen(bin_path, "rb");
-    if (!f) { perror(bin_path); return 0; }
+int tkm_load_weights_buffer(TkmRuntime *rt, const void *buffer, size_t size) {
+    if (!rt || !buffer || size < 2 * sizeof(uint32_t)) return 0;
+    const uint8_t *src = (const uint8_t*)buffer;
     uint32_t magic = 0, nt = 0;
-    if (fread(&magic, sizeof(uint32_t), 1, f) != 1 || magic != TKM_WEIGHT_MAGIC) { fclose(f); return 0; }
-    if (fread(&nt,    sizeof(uint32_t), 1, f) != 1 || (int)nt != rt->h_sgd.count) { fclose(f); return 0; }
+    memcpy(&magic, src, sizeof(magic)); src += sizeof(magic);
+    memcpy(&nt, src, sizeof(nt)); src += sizeof(nt);
+    if (magic != TKM_WEIGHT_MAGIC || nt != (uint32_t)rt->h_sgd.count) return 0;
+    size -= 2 * sizeof(uint32_t);
     for (int i = 0; i < rt->h_sgd.count; i++) {
-        int n = 0;
-        if (fread(&n, sizeof(int), 1, f) != 1 || n != rt->h_sgd.size[i]) { fclose(f); return 0; }
+        uint32_t n = 0;
+        if (size < sizeof(uint32_t)) return 0;
+        memcpy(&n, src, sizeof(n)); src += sizeof(n); size -= sizeof(n);
+        if (n != (uint32_t)rt->h_sgd.size[i] ||
+            (size_t)n > size / sizeof(float)) return 0;
         float *h = (float*)malloc((size_t)n * sizeof(float));
-        if (fread(h, sizeof(float), (size_t)n, f) != (size_t)n) { free(h); fclose(f); return 0; }
+        if (n > 0 && !h) return 0;
+        memcpy(h, src, (size_t)n * sizeof(float));
+        src += (size_t)n * sizeof(float);
+        size -= (size_t)n * sizeof(float);
         CUDA_CHECK(cudaMemcpy(rt->h_sgd.master[i], h, (size_t)n * sizeof(float), cudaMemcpyHostToDevice));
         if (rt->h_sgd.fp16_w[i]) {
             k_f32_to_f16<<<(n + 255) / 256, 256>>>(rt->h_sgd.master[i], rt->h_sgd.fp16_w[i], n);
@@ -1441,10 +1517,107 @@ int tkm_load_weights(TkmRuntime *rt, const char *bin_path) {
         free(h);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
+    return 1;
+}
+
+int tkm_save_weights(TkmRuntime *rt, const char *bin_path) {
+    if (!rt || !bin_path) return 0;
+    size_t size = tkm_runtime_weight_bytes(rt);
+    if (size == 0) return 0;
+    uint8_t *buffer = (uint8_t*)malloc(size);
+    if (!buffer || !tkm_save_weights_buffer(rt, buffer, size, NULL)) {
+        free(buffer);
+        return 0;
+    }
+    FILE *f = fopen(bin_path, "wb");
+    if (!f) { perror(bin_path); free(buffer); return 0; }
+    int ok = fwrite(buffer, 1, size, f) == size;
     fclose(f);
-    printf("  [TKM I/O] Loaded %d learnable tensors (%d params) from '%s'\n",
+    free(buffer);
+    if (!ok) return 0;
+    printf("  [TKM I/O] Saved %d learnable tensors (%d params) to '%s'\n",
            rt->h_sgd.count, rt->total_sgd_elems, bin_path);
     return 1;
+}
+
+int tkm_load_weights(TkmRuntime *rt, const char *bin_path) {
+    if (!rt || !bin_path) return 0;
+    FILE *f = fopen(bin_path, "rb");
+    if (!f) { perror(bin_path); return 0; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long file_size = ftell(f);
+    if (file_size <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
+    size_t size = (size_t)file_size;
+    uint8_t *buffer = (uint8_t*)malloc(size);
+    if (!buffer || fread(buffer, 1, size, f) != size) {
+        free(buffer);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    int ok = tkm_load_weights_buffer(rt, buffer, size);
+    free(buffer);
+    if (ok) {
+        printf("  [TKM I/O] Loaded %d learnable tensors (%d params) from '%s'\n",
+               rt->h_sgd.count, rt->total_sgd_elems, bin_path);
+    }
+    return ok;
+}
+
+int tkm_runtime_train_dataset(TkmRuntime *rt, TkmDatasetNext next_batch,
+                              void *user, size_t max_batches, float lr,
+                              float *out_average_loss) {
+    if (out_average_loss) *out_average_loss = 0.0f;
+    if (!rt || !next_batch || rt->graph.batch_size <= 0) return 0;
+    size_t input_elems = tkm_runtime_input_elements(rt);
+    float *input = (float*)malloc(input_elems * sizeof(float));
+    uint8_t *labels = (uint8_t*)malloc((size_t)rt->graph.batch_size * sizeof(uint8_t));
+    if (!input || !labels) { free(input); free(labels); return 0; }
+    size_t batches = 0;
+    double loss_sum = 0.0;
+    int result = 1;
+    while (max_batches == 0 || batches < max_batches) {
+        size_t count = 0;
+        int status = next_batch(user, input, labels, (size_t)rt->graph.batch_size, &count);
+        if (status == 0) break;
+        if (status < 0 || count != (size_t)rt->graph.batch_size) { result = 0; break; }
+        loss_sum += tkm_runtime_step(rt, input, labels, lr);
+        batches++;
+    }
+    if (result && batches > 0 && out_average_loss) *out_average_loss = (float)(loss_sum / batches);
+    free(input);
+    free(labels);
+    return result && batches > 0;
+}
+
+int tkm_runtime_eval_dataset(TkmRuntime *rt, TkmDatasetNext next_batch,
+                             void *user, size_t max_batches,
+                             int *out_correct, size_t *out_samples) {
+    if (out_correct) *out_correct = 0;
+    if (out_samples) *out_samples = 0;
+    if (!rt || !next_batch || rt->graph.batch_size <= 0 ||
+        tkm_runtime_input_elements(rt) > (size_t)INT_MAX) return 0;
+    size_t input_elems = tkm_runtime_input_elements(rt);
+    float *input = (float*)malloc(input_elems * sizeof(float));
+    uint8_t *labels = (uint8_t*)malloc((size_t)rt->graph.batch_size * sizeof(uint8_t));
+    if (!input || !labels) { free(input); free(labels); return 0; }
+    size_t batches = 0, samples = 0;
+    int correct = 0, result = 1;
+    while (max_batches == 0 || batches < max_batches) {
+        size_t count = 0;
+        int status = next_batch(user, input, labels, (size_t)rt->graph.batch_size, &count);
+        if (status == 0) break;
+        if (status < 0 || count == 0 || count > (size_t)rt->graph.batch_size ||
+            samples > SIZE_MAX - count || count > (size_t)INT_MAX) { result = 0; break; }
+        correct += tkm_runtime_eval(rt, input, labels, (int)count);
+        samples += count;
+        batches++;
+    }
+    if (out_correct) *out_correct = correct;
+    if (out_samples) *out_samples = samples;
+    free(input);
+    free(labels);
+    return result && batches > 0;
 }
 
 void tkm_runtime_free(TkmRuntime *rt) {

@@ -210,14 +210,36 @@ TKM_API char *tkm_codegen_cuda_string(const TkmGraph *g);
    ========================================================================= */
 typedef struct TkmRuntime TkmRuntime;
 
+/*
+ * Fill up to `capacity` samples into the supplied host buffers.
+ * Return a positive value for a batch, zero at end of dataset, or a negative
+ * value on loader error. Training loaders must return exactly the runtime
+ * batch size; evaluation loaders may return a smaller final batch.
+ */
+typedef int (*TkmDatasetNext)(void *user, float *h_input, uint8_t *h_labels,
+                              size_t capacity, size_t *out_count);
+
 TKM_API TkmRuntime *tkm_runtime_ignite(const TkmGraph *g, const char *cuda_src);
 TKM_API TkmRuntime *tkm_load_file(const char *tkm_path, int batch_size);
 TKM_API TkmRuntime *tkm_load_string(const char *dsl_text, int batch_size);
+TKM_API TkmRuntime *tkm_load_buffer(const char *dsl_data, size_t dsl_size, int batch_size);
 TKM_API float       tkm_runtime_step(TkmRuntime *rt, const float *h_input, const uint8_t *h_labels, float lr);
 TKM_API int         tkm_runtime_eval(TkmRuntime *rt, const float *h_input, const uint8_t *h_labels, int count);
 TKM_API size_t      tkm_runtime_forward(TkmRuntime *rt, const float *h_input, float *h_output, size_t output_capacity);
+TKM_API size_t      tkm_runtime_input_elements(const TkmRuntime *rt);
+TKM_API size_t      tkm_runtime_output_elements(const TkmRuntime *rt);
+TKM_API size_t      tkm_runtime_weight_bytes(const TkmRuntime *rt);
+TKM_API int         tkm_runtime_train_dataset(TkmRuntime *rt, TkmDatasetNext next_batch,
+                                               void *user, size_t max_batches, float lr,
+                                               float *out_average_loss);
+TKM_API int         tkm_runtime_eval_dataset(TkmRuntime *rt, TkmDatasetNext next_batch,
+                                              void *user, size_t max_batches,
+                                              int *out_correct, size_t *out_samples);
 TKM_API int         tkm_save_weights(TkmRuntime *rt, const char *bin_path);
 TKM_API int         tkm_load_weights(TkmRuntime *rt, const char *bin_path);
+TKM_API int         tkm_save_weights_buffer(TkmRuntime *rt, void *buffer, size_t capacity,
+                                             size_t *out_size);
+TKM_API int         tkm_load_weights_buffer(TkmRuntime *rt, const void *buffer, size_t size);
 TKM_API void        tkm_runtime_free(TkmRuntime *rt);
 
 /* First-Principles Numerical Finite-Difference GradCheck API */
