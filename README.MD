@@ -108,7 +108,8 @@ tkm/
 │   └── main.c            # Standalone CLI Entry (tkm.exe / tkm)
 ├── models/
 │   ├── resnet_mnist.tkm  # ResNet-CNN markup
-│   └── exotic_llama.tkm  # 4-Layer GQA + SwiGLU LLaMA markup
+│   ├── exotic_llama.tkm  # 4-Layer experimental GQA + SwiGLU transformer
+│   └── llama3_style.tkm  # LLaMA 3 8B-shaped decoder graph
 ├── build.bat             # Windows MSVC Build Script (CLI, DLL, and MNIST ABI example)
 ├── Makefile              # Linux GCC Build Script (Outputs tkm & libtkm.so)
 └── README.md
@@ -164,6 +165,30 @@ tkm.exe bench
  SIREN-PINN Periodic Field Net      |  1024 |     14 |  12.31 MB (72.2%) |   0.992 | 1032665.8
  Exotic-LLaMA (4L GQA+QKNorm+RoPE)  |    32 |     50 | 520.47 MB (30.8%) |  38.136 |     839.1
 =========================================================================================
+```
+
+### LLaMA 3 8B-Style Decoder
+`models/llama3_style.tkm` describes the Llama 3 8B decoder dimensions:
+32 layers, 4096 hidden width, 32 query heads / 8 KV heads with 128 dimensions
+per head, a 14336-wide SwiGLU FFN, and a 128256-logit output head. The example
+uses a 128-token input chunk for shape planning; it is not the model's maximum
+context length.
+
+This is an architecture graph, not a drop-in Llama 3 runtime: input embeddings
+and tokenization remain host responsibilities. The `.tkm` graph configures
+128-dimensional GQA, causal attention, and LLaMA 3 RoPE frequency interpolation.
+Tokamak's `FC` projections include biases, unlike the reference model, and the
+current GQA runtime recomputes attention over the supplied sequence rather than
+maintaining a KV cache. The output projection emits logits without a
+`SoftmaxCE` sink; `tkm_runtime_forward` returns the final tensor to the host for
+sampling.
+Static graph capacities in `include/tkm.h` are sized to accommodate this
+32-layer graph.
+
+Inspect the graph and estimate its planned buffers with:
+
+```bash
+tkm.exe inspect models/llama3_style.tkm --batch 1
 ```
 
 ### 3. End-to-End Training & Checkpointing Working Demo (`demo`)

@@ -238,13 +238,14 @@ void k_col2im_3x3_h(const __half * __restrict__ col, __half * __restrict__ din, 
     din[idx] = __float2half(sum);
 }
 
-#define SMEM_PAD_64 72
 #define SMEM_PAD_16 24
 
+template<int HEAD_DIM>
 __global__ __launch_bounds__(64, 4)
 void k_gqa_flash_attn_tc_fwd(const __half * __restrict__ qkv, __half * __restrict__ out,
                              float * __restrict__ save_lse,
-                             int B, int Seq, int Q_H, int KV_H, float scale) {
+                             int B, int Seq, int Q_H, int KV_H, float scale, int causal) {
+    constexpr int HEAD_PAD = HEAD_DIM + 8;
     int q_h     = blockIdx.x % Q_H;
     int b       = blockIdx.x / Q_H;
     int q_blk   = blockIdx.y;
@@ -255,43 +256,42 @@ void k_gqa_flash_attn_tc_fwd(const __half * __restrict__ qkv, __half * __restric
     int group_g = Q_H / KV_H;
     int kv_h    = q_h / group_g;
     int q_base  = q_blk * 32 + warp_id * 16;
-    if (q_base >= Seq) return;
 
     int total_h    = Q_H + 2 * KV_H;
-    int qkv_stride = total_h * 64;
-    int out_stride = Q_H * 64;
+    int qkv_stride = total_h * HEAD_DIM;
+    int out_stride = Q_H * HEAD_DIM;
 
-    __shared__ __half s_q[32][SMEM_PAD_64];
-    __shared__ __half s_k[16][SMEM_PAD_64];
-    __shared__ __half s_v[16][SMEM_PAD_64];
+    __shared__ __half s_q[32][HEAD_PAD];
+    __shared__ __half s_k[16][HEAD_PAD];
+    __shared__ __half s_v[16][HEAD_PAD];
     __shared__ float  s_scores[2][16][SMEM_PAD_16];
     __shared__ __half s_p[2][16][SMEM_PAD_16];
-    __shared__ float  s_out[2][16][SMEM_PAD_64];
+    __shared__ float  s_out[2][16][HEAD_PAD];
 
     const __half *b_qkv = qkv + (size_t)b * Seq * qkv_stride;
     __half       *b_out = out + (size_t)b * Seq * out_stride;
 
-    for (int i = tid * 2; i < 32 * 64; i += 128) {
-        int r = i >> 6, c = i & 63;
+    for (int i = tid * 2; i < 32 * HEAD_DIM; i += 128) {
+        int r = i / HEAD_DIM, c = i % HEAD_DIM;
         int g_r = q_blk * 32 + r;
         if (g_r < Seq) {
             *reinterpret_cast<__half2*>(&s_q[r][c]) =
-                *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + q_h * 64 + c]);
+                *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + q_h * HEAD_DIM + c]);
         } else {
             *reinterpret_cast<__half2*>(&s_q[r][c]) = __float2half2_rn(0.f);
         }
     }
     __syncthreads();
 
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_q[4];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_q[HEAD_DIM / 16];
     #pragma unroll
-    for (int ks = 0; ks < 4; ks++) {
-        wmma::load_matrix_sync(frag_q[ks], &s_q[warp_id * 16][ks * 16], SMEM_PAD_64);
+    for (int ks = 0; ks < HEAD_DIM / 16; ks++) {
+        wmma::load_matrix_sync(frag_q[ks], &s_q[warp_id * 16][ks * 16], HEAD_PAD);
     }
 
     #pragma unroll
     for (int r = 0; r < 16; r++) {
-        for (int c = lane * 2; c < 64; c += 64) {
+        for (int c = lane * 2; c < HEAD_DIM; c += 64) {
             s_out[warp_id][r][c]     = 0.0f;
             s_out[warp_id][r][c + 1] = 0.0f;
         }
@@ -299,14 +299,14 @@ void k_gqa_flash_attn_tc_fwd(const __half * __restrict__ qkv, __half * __restric
     float m_row = -1e30f, l_row = 0.0f;
 
     for (int kv_base = 0; kv_base < Seq; kv_base += 16) {
-        for (int i = tid * 2; i < 16 * 64; i += 128) {
-            int r = i >> 6, c = i & 63;
+        for (int i = tid * 2; i < 16 * HEAD_DIM; i += 128) {
+            int r = i / HEAD_DIM, c = i % HEAD_DIM;
             int g_r = kv_base + r;
             if (g_r < Seq) {
                 *reinterpret_cast<__half2*>(&s_k[r][c]) =
-                    *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + (Q_H + kv_h) * 64 + c]);
+                    *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + (Q_H + kv_h) * HEAD_DIM + c]);
                 *reinterpret_cast<__half2*>(&s_v[r][c]) =
-                    *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + (Q_H + KV_H + kv_h) * 64 + c]);
+                    *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + (Q_H + KV_H + kv_h) * HEAD_DIM + c]);
             } else {
                 *reinterpret_cast<__half2*>(&s_k[r][c]) = __float2half2_rn(0.f);
                 *reinterpret_cast<__half2*>(&s_v[r][c]) = __float2half2_rn(0.f);
@@ -317,9 +317,9 @@ void k_gqa_flash_attn_tc_fwd(const __half * __restrict__ qkv, __half * __restric
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_s;
         wmma::fill_fragment(frag_s, 0.0f);
         #pragma unroll
-        for (int ks = 0; ks < 4; ks++) {
+        for (int ks = 0; ks < HEAD_DIM / 16; ks++) {
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> frag_k;
-            wmma::load_matrix_sync(frag_k, &s_k[0][ks * 16], SMEM_PAD_64);
+            wmma::load_matrix_sync(frag_k, &s_k[0][ks * 16], HEAD_PAD);
             wmma::mma_sync(frag_s, frag_q[ks], frag_k, frag_s);
         }
         wmma::store_matrix_sync(&s_scores[warp_id][0][0], frag_s, SMEM_PAD_16, wmma::mem_row_major);
@@ -329,7 +329,9 @@ void k_gqa_flash_attn_tc_fwd(const __half * __restrict__ qkv, __half * __restric
             float row_max = m_row;
             #pragma unroll
             for (int c = 0; c < 16; c++) {
+                int key_pos = kv_base + c;
                 float v = s_scores[warp_id][lane][c] * scale;
+                if (key_pos >= Seq || (causal && key_pos > q_base + lane)) v = -1e30f;
                 s_scores[warp_id][lane][c] = v;
                 if (v > row_max) row_max = v;
             }
@@ -342,7 +344,7 @@ void k_gqa_flash_attn_tc_fwd(const __half * __restrict__ qkv, __half * __restric
                 row_sum += p;
             }
             #pragma unroll
-            for (int d = 0; d < 64; d++) {
+            for (int d = 0; d < HEAD_DIM; d++) {
                 s_out[warp_id][lane][d] *= alpha;
             }
             l_row = l_row * alpha + row_sum;
@@ -353,13 +355,13 @@ void k_gqa_flash_attn_tc_fwd(const __half * __restrict__ qkv, __half * __restric
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_p;
         wmma::load_matrix_sync(frag_p, &s_p[warp_id][0][0], SMEM_PAD_16);
         #pragma unroll
-        for (int d = 0; d < 4; d++) {
+        for (int d = 0; d < HEAD_DIM / 16; d++) {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_o;
-            wmma::load_matrix_sync(frag_o, &s_out[warp_id][0][d * 16], SMEM_PAD_64, wmma::mem_row_major);
+            wmma::load_matrix_sync(frag_o, &s_out[warp_id][0][d * 16], HEAD_PAD, wmma::mem_row_major);
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> frag_v;
-            wmma::load_matrix_sync(frag_v, &s_v[0][d * 16], SMEM_PAD_64);
+            wmma::load_matrix_sync(frag_v, &s_v[0][d * 16], HEAD_PAD);
             wmma::mma_sync(frag_o, frag_p, frag_v, frag_o);
-            wmma::store_matrix_sync(&s_out[warp_id][0][d * 16], frag_o, SMEM_PAD_64, wmma::mem_row_major);
+            wmma::store_matrix_sync(&s_out[warp_id][0][d * 16], frag_o, HEAD_PAD, wmma::mem_row_major);
         }
         __syncthreads();
     }
@@ -367,20 +369,22 @@ void k_gqa_flash_attn_tc_fwd(const __half * __restrict__ qkv, __half * __restric
     if (lane < 16 && (q_base + lane) < Seq) {
         float inv_l = 1.0f / (l_row + 1e-8f);
         if (save_lse) save_lse[(b * Q_H + q_h) * Seq + q_base + lane] = m_row + __logf(l_row + 1e-8f);
-        __half *dst_row = b_out + (q_base + lane) * out_stride + q_h * 64;
+        __half *dst_row = b_out + (q_base + lane) * out_stride + q_h * HEAD_DIM;
         #pragma unroll
-        for (int d = 0; d < 64; d += 2) {
+        for (int d = 0; d < HEAD_DIM; d += 2) {
             *reinterpret_cast<__half2*>(&dst_row[d]) =
                 __floats2half2_rn(s_out[warp_id][lane][d] * inv_l, s_out[warp_id][lane][d + 1] * inv_l);
         }
     }
 }
 
+template<int HEAD_DIM>
 __global__ __launch_bounds__(64, 4)
 void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __restrict__ out,
                              const __half * __restrict__ dout, const float * __restrict__ save_lse,
                              __half * __restrict__ dqkv,
-                             int B, int Seq, int Q_H, int KV_H, float scale) {
+                             int B, int Seq, int Q_H, int KV_H, float scale, int causal) {
+    constexpr int HEAD_PAD = HEAD_DIM + 8;
     int q_h     = blockIdx.x % Q_H;
     int b       = blockIdx.x / Q_H;
     int q_blk   = blockIdx.y;
@@ -391,34 +395,33 @@ void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __r
     int group_g = Q_H / KV_H;
     int kv_h    = q_h / group_g;
     int q_base  = q_blk * 32 + warp_id * 16;
-    if (q_base >= Seq) return;
 
     int total_h    = Q_H + 2 * KV_H;
-    int qkv_stride = total_h * 64;
-    int out_stride = Q_H * 64;
+    int qkv_stride = total_h * HEAD_DIM;
+    int out_stride = Q_H * HEAD_DIM;
 
-    __shared__ __half s_q[32][SMEM_PAD_64];
-    __shared__ __half s_do[32][SMEM_PAD_64];
-    __shared__ __half s_k[16][SMEM_PAD_64];
-    __shared__ __half s_v[16][SMEM_PAD_64];
+    __shared__ __half s_q[32][HEAD_PAD];
+    __shared__ __half s_do[32][HEAD_PAD];
+    __shared__ __half s_k[16][HEAD_PAD];
+    __shared__ __half s_v[16][HEAD_PAD];
     __shared__ float  s_s[2][16][SMEM_PAD_16];
     __shared__ float  s_dp[2][16][SMEM_PAD_16];
     __shared__ __half s_ds[2][16][SMEM_PAD_16];
-    __shared__ __half s_dq_h[2][16][SMEM_PAD_64];
+    __shared__ __half s_dq_h[2][16][HEAD_PAD];
 
     const __half *b_qkv  = qkv  + (size_t)b * Seq * qkv_stride;
     const __half *b_out  = out  + (size_t)b * Seq * out_stride;
     const __half *b_dout = dout + (size_t)b * Seq * out_stride;
     __half       *b_dqkv = dqkv + (size_t)b * Seq * qkv_stride;
 
-    for (int i = tid * 2; i < 32 * 64; i += 128) {
-        int r = i >> 6, c = i & 63;
+    for (int i = tid * 2; i < 32 * HEAD_DIM; i += 128) {
+        int r = i / HEAD_DIM, c = i % HEAD_DIM;
         int g_r = q_blk * 32 + r;
         if (g_r < Seq) {
             *reinterpret_cast<__half2*>(&s_q[r][c]) =
-                *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + q_h * 64 + c]);
+                *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + q_h * HEAD_DIM + c]);
             *reinterpret_cast<__half2*>(&s_do[r][c]) =
-                *reinterpret_cast<const __half2*>(&b_dout[g_r * out_stride + q_h * 64 + c]);
+                *reinterpret_cast<const __half2*>(&b_dout[g_r * out_stride + q_h * HEAD_DIM + c]);
         } else {
             *reinterpret_cast<__half2*>(&s_q[r][c])  = __float2half2_rn(0.f);
             *reinterpret_cast<__half2*>(&s_do[r][c]) = __float2half2_rn(0.f);
@@ -426,38 +429,38 @@ void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __r
     }
     __syncthreads();
 
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_q[4];
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_do[4];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_q[HEAD_DIM / 16];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_do[HEAD_DIM / 16];
     #pragma unroll
-    for (int ks = 0; ks < 4; ks++) {
-        wmma::load_matrix_sync(frag_q[ks],  &s_q[warp_id * 16][ks * 16],  SMEM_PAD_64);
-        wmma::load_matrix_sync(frag_do[ks], &s_do[warp_id * 16][ks * 16], SMEM_PAD_64);
+    for (int ks = 0; ks < HEAD_DIM / 16; ks++) {
+        wmma::load_matrix_sync(frag_q[ks],  &s_q[warp_id * 16][ks * 16],  HEAD_PAD);
+        wmma::load_matrix_sync(frag_do[ks], &s_do[warp_id * 16][ks * 16], HEAD_PAD);
     }
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_dq[4];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_dq[HEAD_DIM / 16];
     #pragma unroll
-    for (int d = 0; d < 4; d++) wmma::fill_fragment(frag_dq[d], 0.0f);
+    for (int d = 0; d < HEAD_DIM / 16; d++) wmma::fill_fragment(frag_dq[d], 0.0f);
 
     float lse_row = 0.0f, D_row = 0.0f;
     if (lane < 16 && (q_base + lane) < Seq) {
         lse_row = save_lse[(b * Q_H + q_h) * Seq + q_base + lane];
-        const __half *o_ptr  = b_out  + (q_base + lane) * out_stride + q_h * 64;
-        const __half *do_ptr = b_dout + (q_base + lane) * out_stride + q_h * 64;
+        const __half *o_ptr  = b_out  + (q_base + lane) * out_stride + q_h * HEAD_DIM;
+        const __half *do_ptr = b_dout + (q_base + lane) * out_stride + q_h * HEAD_DIM;
         float sum_d = 0.0f;
         #pragma unroll
-        for (int d = 0; d < 64; d++) sum_d += __half2float(o_ptr[d]) * __half2float(do_ptr[d]);
+        for (int d = 0; d < HEAD_DIM; d++) sum_d += __half2float(o_ptr[d]) * __half2float(do_ptr[d]);
         D_row = sum_d;
     }
 
     for (int kv_base = 0; kv_base < Seq; kv_base += 16) {
-        for (int i = tid * 2; i < 16 * 64; i += 128) {
-            int r = i >> 6, c = i & 63;
+        for (int i = tid * 2; i < 16 * HEAD_DIM; i += 128) {
+            int r = i / HEAD_DIM, c = i % HEAD_DIM;
             int g_r = kv_base + r;
             if (g_r < Seq) {
                 *reinterpret_cast<__half2*>(&s_k[r][c]) =
-                    *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + (Q_H + kv_h) * 64 + c]);
+                    *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + (Q_H + kv_h) * HEAD_DIM + c]);
                 *reinterpret_cast<__half2*>(&s_v[r][c]) =
-                    *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + (Q_H + KV_H + kv_h) * 64 + c]);
+                    *reinterpret_cast<const __half2*>(&b_qkv[g_r * qkv_stride + (Q_H + KV_H + kv_h) * HEAD_DIM + c]);
             } else {
                 *reinterpret_cast<__half2*>(&s_k[r][c]) = __float2half2_rn(0.f);
                 *reinterpret_cast<__half2*>(&s_v[r][c]) = __float2half2_rn(0.f);
@@ -469,10 +472,10 @@ void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __r
         wmma::fill_fragment(frag_s, 0.0f);
         wmma::fill_fragment(frag_dp, 0.0f);
         #pragma unroll
-        for (int ks = 0; ks < 4; ks++) {
+        for (int ks = 0; ks < HEAD_DIM / 16; ks++) {
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> frag_kt, frag_vt;
-            wmma::load_matrix_sync(frag_kt, &s_k[0][ks * 16], SMEM_PAD_64);
-            wmma::load_matrix_sync(frag_vt, &s_v[0][ks * 16], SMEM_PAD_64);
+            wmma::load_matrix_sync(frag_kt, &s_k[0][ks * 16], HEAD_PAD);
+            wmma::load_matrix_sync(frag_vt, &s_v[0][ks * 16], HEAD_PAD);
             wmma::mma_sync(frag_s,  frag_q[ks],  frag_kt, frag_s);
             wmma::mma_sync(frag_dp, frag_do[ks], frag_vt, frag_dp);
         }
@@ -483,8 +486,10 @@ void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __r
         if (lane < 16) {
             #pragma unroll
             for (int c = 0; c < 16; c++) {
-                float p_ij  = __expf(s_s[warp_id][lane][c] * scale - lse_row);
-                float ds_ij = p_ij * (s_dp[warp_id][lane][c] - D_row) * scale;
+                int key_pos = kv_base + c;
+                int masked = key_pos >= Seq || (causal && key_pos > q_base + lane);
+                float p_ij  = masked ? 0.0f : __expf(s_s[warp_id][lane][c] * scale - lse_row);
+                float ds_ij = masked ? 0.0f : p_ij * (s_dp[warp_id][lane][c] - D_row) * scale;
                 s_ds[warp_id][lane][c] = __float2half(ds_ij);
             }
         }
@@ -493,16 +498,16 @@ void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __r
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> frag_ds;
         wmma::load_matrix_sync(frag_ds, &s_ds[warp_id][0][0], SMEM_PAD_16);
         #pragma unroll
-        for (int d = 0; d < 4; d++) {
+        for (int d = 0; d < HEAD_DIM / 16; d++) {
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> frag_k_row;
-            wmma::load_matrix_sync(frag_k_row, &s_k[0][d * 16], SMEM_PAD_64);
+            wmma::load_matrix_sync(frag_k_row, &s_k[0][d * 16], HEAD_PAD);
             wmma::mma_sync(frag_dq[d], frag_ds, frag_k_row, frag_dq[d]);
         }
         __syncthreads();
     }
 
     #pragma unroll
-    for (int d = 0; d < 4; d++) {
+    for (int d = 0; d < HEAD_DIM / 16; d++) {
         wmma::store_matrix_sync(reinterpret_cast<float*>(&s_s[warp_id][0][0]), frag_dq[d], 16, wmma::mem_row_major);
         __syncwarp();
         if (lane < 16) {
@@ -516,16 +521,16 @@ void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __r
 
     if (lane < 16 && (q_base + lane) < Seq) {
         int r_idx = q_base + lane;
-        __half *dq_row = b_dqkv + r_idx * qkv_stride + q_h * 64;
+        __half *dq_row = b_dqkv + r_idx * qkv_stride + q_h * HEAD_DIM;
         #pragma unroll
-        for (int d = 0; d < 64; d += 2) {
+        for (int d = 0; d < HEAD_DIM; d += 2) {
             *reinterpret_cast<__half2*>(&dq_row[d]) = *reinterpret_cast<const __half2*>(&s_dq_h[warp_id][lane][d]);
         }
         if ((q_h % group_g) == 0) {
-            __half *dk_row = b_dqkv + r_idx * qkv_stride + (Q_H + kv_h) * 64;
-            __half *dv_row = b_dqkv + r_idx * qkv_stride + (Q_H + KV_H + kv_h) * 64;
+            __half *dk_row = b_dqkv + r_idx * qkv_stride + (Q_H + kv_h) * HEAD_DIM;
+            __half *dv_row = b_dqkv + r_idx * qkv_stride + (Q_H + KV_H + kv_h) * HEAD_DIM;
             #pragma unroll
-            for (int d = 0; d < 64; d += 2) {
+            for (int d = 0; d < HEAD_DIM; d += 2) {
                 *reinterpret_cast<__half2*>(&dk_row[d]) = *reinterpret_cast<__half2*>(&dq_row[d]);
                 *reinterpret_cast<__half2*>(&dv_row[d]) = *reinterpret_cast<const __half2*>(&s_do[warp_id * 16 + lane][d]);
             }
@@ -1061,9 +1066,15 @@ static void execute_forward_pass(TkmRuntime *rt, int is_eval, int valid_examples
             case OP_GQA_ATTN: {
                 int Seq = n->H * n->W;
                 dim3 grid(B * n->q_heads, (Seq + 31) / 32);
-                k_gqa_flash_attn_tc_fwd<<<grid, 64, 0, rt->stream>>>(
-                    (const __half*)in_ptr, (__half*)out_ptr, rt->nstate[i].d_save_istd,
-                    B, Seq, n->q_heads, n->kv_heads, 1.0f / sqrtf((float)n->head_dim));
+                if (n->head_dim == 64) {
+                    k_gqa_flash_attn_tc_fwd<64><<<grid, 64, 0, rt->stream>>>(
+                        (const __half*)in_ptr, (__half*)out_ptr, rt->nstate[i].d_save_istd,
+                        B, Seq, n->q_heads, n->kv_heads, 1.0f / sqrtf((float)n->head_dim), n->causal);
+                } else {
+                    k_gqa_flash_attn_tc_fwd<128><<<grid, 64, 0, rt->stream>>>(
+                        (const __half*)in_ptr, (__half*)out_ptr, rt->nstate[i].d_save_istd,
+                        B, Seq, n->q_heads, n->kv_heads, 1.0f / sqrtf((float)n->head_dim), n->causal);
+                }
                 break;
             }
             case OP_FLATTEN:
@@ -1179,10 +1190,17 @@ static void record_full_step_stream(TkmRuntime *rt) {
             case OP_GQA_ATTN: {
                 int Seq = n->H * n->W;
                 dim3 grid(B * n->q_heads, (Seq + 31) / 32);
-                k_gqa_flash_attn_tc_bwd<<<grid, 64, 0, rt->stream>>>(
-                    (const __half*)in_act, (const __half*)out_act, (const __half*)dout,
-                    rt->nstate[i].d_save_istd, (__half*)din,
-                    B, Seq, n->q_heads, n->kv_heads, 1.0f / sqrtf((float)n->head_dim));
+                if (n->head_dim == 64) {
+                    k_gqa_flash_attn_tc_bwd<64><<<grid, 64, 0, rt->stream>>>(
+                        (const __half*)in_act, (const __half*)out_act, (const __half*)dout,
+                        rt->nstate[i].d_save_istd, (__half*)din,
+                        B, Seq, n->q_heads, n->kv_heads, 1.0f / sqrtf((float)n->head_dim), n->causal);
+                } else {
+                    k_gqa_flash_attn_tc_bwd<128><<<grid, 64, 0, rt->stream>>>(
+                        (const __half*)in_act, (const __half*)out_act, (const __half*)dout,
+                        rt->nstate[i].d_save_istd, (__half*)din,
+                        B, Seq, n->q_heads, n->kv_heads, 1.0f / sqrtf((float)n->head_dim), n->causal);
+                }
                 break;
             }
             case OP_FLATTEN:
@@ -1266,6 +1284,59 @@ float tkm_runtime_step(TkmRuntime *rt, const float *h_input, const uint8_t *h_la
         CUDA_CHECK(cudaStreamSynchronize(rt->stream));
     }
     return h_loss;
+}
+
+size_t tkm_runtime_forward(TkmRuntime *rt, const float *h_input, float *h_output, size_t output_capacity) {
+    if (!rt || !h_input || !h_output) {
+        fprintf(stderr, "[TKM API Error] tkm_runtime_forward requires a runtime and non-null input/output buffers.\n");
+        return 0;
+    }
+
+    const TkmGraph *g = &rt->graph;
+    int B = g->batch_size;
+    int in_elems = B * g->nodes[0].H * g->nodes[0].W * g->nodes[0].C;
+    int output_id = -1;
+    for (int i = g->num_nodes - 1; i >= 0; i--) {
+        if (!g->nodes[i].dead) {
+            output_id = i;
+            break;
+        }
+    }
+    if (output_id < 0 || g->nodes[output_id].op == OP_SOFTMAX_CE ||
+        g->nodes[output_id].op == OP_SOFTMAX_FOCAL ||
+        g->nodes[output_id].op == OP_SOFTMAX_MSE) {
+        fprintf(stderr, "[TKM API Error] tkm_runtime_forward requires a graph ending in a tensor output, not a loss sink.\n");
+        return 0;
+    }
+
+    const TkmNode *output = &g->nodes[output_id];
+    size_t output_elems = (size_t)B * output->H * output->W * output->C;
+    if (output_elems > 2147483647u) {
+        fprintf(stderr, "[TKM API Error] Inference output exceeds the supported element count.\n");
+        return 0;
+    }
+    if (output_capacity < output_elems) {
+        fprintf(stderr, "[TKM API Error] Inference output buffer needs %zu floats; capacity is %zu.\n",
+                output_elems, output_capacity);
+        return 0;
+    }
+    __half *host_output = (__half*)malloc(output_elems * sizeof(__half));
+    if (!host_output) {
+        fprintf(stderr, "[TKM Error] Unable to allocate temporary inference output.\n");
+        return 0;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(rt->d_input_f32, h_input, (size_t)in_elems * sizeof(float),
+                               cudaMemcpyHostToDevice, rt->stream));
+    k_f32_to_f16<<<(in_elems + 255) / 256, 256, 0, rt->stream>>>(
+        rt->d_input_f32, (__half*)(rt->d_arena + g->nodes[0].out_offset), in_elems);
+    execute_forward_pass(rt, 1, B);
+    CUDA_CHECK(cudaMemcpyAsync(host_output, rt->d_arena + output->out_offset,
+                               output_elems * sizeof(__half), cudaMemcpyDeviceToHost, rt->stream));
+    CUDA_CHECK(cudaStreamSynchronize(rt->stream));
+    for (size_t i = 0; i < output_elems; i++) h_output[i] = __half2float(host_output[i]);
+    free(host_output);
+    return output_elems;
 }
 
 /* Evaluate single scalar loss of current state on GPU */

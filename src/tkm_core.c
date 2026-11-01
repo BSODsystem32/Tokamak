@@ -53,6 +53,11 @@ static int new_node(TkmGraph *g, const TkmOpSpec *spec, int in0, int in1, int in
     n->k = 1; n->s = 1; n->p = 0;
     n->fval = spec ? spec->default_fval : 0.0f;
     n->fval2 = 4.0f;
+    n->rope_theta = 10000.0f;
+    n->rope_scale = 1.0f;
+    n->rope_low_freq_factor = 1.0f;
+    n->rope_high_freq_factor = 4.0f;
+    n->rope_original_context_length = 8192.0f;
     n->rng_type = RNG_DEFAULT;
     snprintf(n->tag, sizeof(n->tag), "%s_%d", tag ? tag : (spec ? spec->dsl_name : "input"), id);
     return id;
@@ -75,6 +80,10 @@ static void parse_args(const char **p, TkmNode *n) {
                 char rname[32];
                 read_ident(p, rname, sizeof(rname));
                 n->rng_type = tkm_parse_rng_name(rname);
+            } else if (!strcmp(key, "causal") || !strcmp(key, "mask")) {
+                char value[32];
+                read_ident(p, value, sizeof(value));
+                n->causal = !strcmp(value, "true") || !strcmp(value, "causal") || !strcmp(value, "1");
             } else {
                 float v = read_num(p);
                 if (!strcmp(key, "c") || !strcmp(key, "out")) n->c_out = (int)v;
@@ -84,6 +93,11 @@ static void parse_args(const char **p, TkmNode *n) {
                 else if (!strcmp(key, "q")) n->q_heads = (int)v;
                 else if (!strcmp(key, "kv")) n->kv_heads = (int)v;
                 else if (!strcmp(key, "d")) n->head_dim = (int)v;
+                else if (!strcmp(key, "theta")) n->rope_theta = v;
+                else if (!strcmp(key, "scale")) n->rope_scale = v;
+                else if (!strcmp(key, "low_freq_factor")) n->rope_low_freq_factor = v;
+                else if (!strcmp(key, "high_freq_factor")) n->rope_high_freq_factor = v;
+                else if (!strcmp(key, "original_context_length")) n->rope_original_context_length = v;
                 else if (!strcmp(key, "r") || !strcmp(key, "sigma") || !strcmp(key, "radius")) n->fval2 = v;
                 else n->fval = v;
             }
@@ -371,7 +385,30 @@ void tkm_optimize_and_bind(TkmGraph *g) {
     tkm_infer_shapes(g);
 
     for (int i = 0; i < g->num_nodes; i++) {
-        const TkmNode *n = &g->nodes[i];
+        TkmNode *n = &g->nodes[i];
+        if (!n->dead && n->op == OP_GQA_ATTN) {
+            if ((n->head_dim != 64 && n->head_dim != 128) ||
+                n->q_heads <= 0 || n->kv_heads <= 0 ||
+                n->q_heads % n->kv_heads != 0 ||
+                n->q_heads * n->head_dim != g->nodes[n->in0].C ||
+                n->kv_heads * n->head_dim != g->nodes[n->in1].C ||
+                n->kv_heads * n->head_dim != g->nodes[n->in2].C) {
+                fprintf(stderr,
+                        "[TKM Shape Error] GQA node #%d (%s) requires head_dim 64 or 128, divisible query/KV heads, and Q/K/V widths matching the configured heads.\n",
+                        i, n->tag);
+                exit(1);
+            }
+        }
+        if (!n->dead && n->op == OP_ROPE &&
+            (!(n->rope_theta > 0.0f) || !(n->rope_scale >= 1.0f) ||
+             !(n->rope_low_freq_factor > 0.0f) ||
+             !(n->rope_high_freq_factor > n->rope_low_freq_factor) ||
+             !(n->rope_original_context_length > 0.0f))) {
+            fprintf(stderr,
+                    "[TKM Shape Error] RoPE node #%d (%s) requires theta>0, scale>=1, 0<low_freq_factor<high_freq_factor, and original_context_length>0.\n",
+                    i, n->tag);
+            exit(1);
+        }
         if (!n->dead && n->op == OP_MIXPOOL && n->C % 2 != 0) {
             fprintf(stderr, "[TKM Shape Error] MixPool node #%d (%s) has odd channel count %d; CUDA half2 kernels require an even channel count.\n",
                     i, n->tag, n->C);

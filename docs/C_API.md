@@ -117,3 +117,15 @@ int main(void) {
 The input and label buffers are host memory. Provide `batch_size * H * W * C`
 floats and `batch_size` labels for each training step, matching the model input
 shape and runtime batch size.
+
+For inference graphs that end in logits rather than a loss sink,
+`tkm_runtime_forward` accepts one fixed-size batch of host `float` inputs and
+writes the final tensor as host `float` values. Its `output_capacity` is the
+number of floats available in the output buffer; it returns the number written,
+or zero on failure (with a diagnostic on `stderr`). The caller can keep
+tokenization and embedding lookup outside Tokamak, pass the resulting
+embeddings, and use the returned logits for sampling.
+
+For `models/llama3_style.tkm` with batch size 1, allocate `128 * 128256` output
+floats; the returned tensor is `[sequence, vocabulary]`, so the last token's
+logits begin at offset `127 * 128256`.

@@ -1,0 +1,26 @@
+# LLaMA 3 8B-shaped decoder graph.
+# Input rows are precomputed token embeddings; this graph emits vocabulary logits.
+input: 1x128x4096
+prng: pcg32
+
+flow:
+  layer x 32: {
+    attention: {
+      branch: RMSNorm -> {
+        q: FC(4096) -> RoPE(theta=500000, scale=8, low_freq_factor=1, high_freq_factor=4, original_context_length=8192)
+        k: FC(1024) -> RoPE(theta=500000, scale=8, low_freq_factor=1, high_freq_factor=4, original_context_length=8192)
+        v: FC(1024)
+      } -> GQA(q=32, kv=8, d=128, causal=true) -> FC(4096)
+      skip: Identity
+    } -> Add
+
+    ffn: {
+      branch: RMSNorm -> {
+        gate: FC(14336) -> SiLU
+        up: FC(14336)
+      } -> Mul -> FC(4096)
+      skip: Identity
+    } -> Add
+  }
+
+  head: RMSNorm -> FC(128256)
