@@ -652,6 +652,7 @@ int main(void) {
      * The public ABI does not expose a backward-only/no-update call.
      */
     tkm_runtime_step(rt, input, &label, 1e-3f);
+    if (!tkm_save_weights(rt, "resnet-after-step.bin")) return 1;
 
     free(output);
     free(input);
@@ -678,6 +679,7 @@ struct Runtime {
 int main() {
     Runtime model("models/llama3_style.tkm", 1);
     if (!model.p) return 1;
+    if (!tkm_load_weights(model.p, "llama3-trained.bin")) return 1;
 
     const size_t input_n = tkm_runtime_input_elements(model.p);
     const size_t output_n = tkm_runtime_output_elements(model.p);
@@ -687,6 +689,7 @@ int main() {
     const size_t written =
         tkm_runtime_forward(model.p, embeddings.data(), logits.data(),
                             logits.size());
+    if (!tkm_save_weights(model.p, "llama3-after-inference.bin")) return 1;
     return written == output_n ? 0 : 1;
 }
 ```
@@ -718,6 +721,10 @@ lib.tkm_runtime_step.argtypes = [
     Runtime, C.POINTER(C.c_float), C.POINTER(C.c_uint8), C.c_float
 ]
 lib.tkm_runtime_step.restype = C.c_float
+lib.tkm_load_weights.argtypes = [Runtime, C.c_char_p]
+lib.tkm_load_weights.restype = C.c_int
+lib.tkm_save_weights.argtypes = [Runtime, C.c_char_p]
+lib.tkm_save_weights.restype = C.c_int
 lib.tkm_runtime_free.argtypes = [Runtime]
 lib.tkm_runtime_free.restype = None
 
@@ -726,6 +733,8 @@ if not rt:
     raise RuntimeError("Tokamak runtime creation failed")
 
 try:
+    if not lib.tkm_load_weights(rt, b"resnet-start.bin"):
+        raise RuntimeError("checkpoint load failed")
     input_n = lib.tkm_runtime_input_elements(rt)
     output_n = lib.tkm_runtime_output_elements(rt)
     x = (C.c_float * input_n)()
@@ -737,6 +746,8 @@ try:
 
     labels = (C.c_uint8 * 1)(0)
     loss = lib.tkm_runtime_step(rt, x, labels, C.c_float(1e-3))
+    if not lib.tkm_save_weights(rt, b"resnet-after-step.bin"):
+        raise RuntimeError("checkpoint save failed")
 finally:
     lib.tkm_runtime_free(rt)
 ```
@@ -756,6 +767,8 @@ extern "C" {
     fn tkm_runtime_output_elements(rt: *const TkmRuntime) -> usize;
     fn tkm_runtime_forward(rt: *mut TkmRuntime, input: *const c_float,
                            output: *mut c_float, capacity: usize) -> usize;
+    fn tkm_load_weights(rt: *mut TkmRuntime, path: *const c_char) -> c_int;
+    fn tkm_save_weights(rt: *mut TkmRuntime, path: *const c_char) -> c_int;
     fn tkm_runtime_free(rt: *mut TkmRuntime);
 }
 
@@ -764,11 +777,15 @@ fn main() {
     unsafe {
         let rt = tkm_load_file(path.as_ptr(), 1);
         assert!(!rt.is_null());
+        let checkpoint = CString::new("llama3-start.bin").unwrap();
+        assert_eq!(tkm_load_weights(rt, checkpoint.as_ptr()), 1);
         let input = vec![0.0f32; tkm_runtime_input_elements(rt)];
         let mut output = vec![0.0f32; tkm_runtime_output_elements(rt)];
         let written = tkm_runtime_forward(
             rt, input.as_ptr(), output.as_mut_ptr(), output.len());
         assert_eq!(written, output.len());
+        let saved = CString::new("llama3-after-forward.bin").unwrap();
+        assert_eq!(tkm_save_weights(rt, saved.as_ptr()), 1);
         tkm_runtime_free(rt);
     }
 }
@@ -800,15 +817,27 @@ static class Tokamak {
         IntPtr rt, float[] input, float[] output, nuint capacity);
 
     [DllImport("tkm.dll", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int tkm_load_weights(
+        IntPtr rt, [MarshalAs(UnmanagedType.LPStr)] string path);
+
+    [DllImport("tkm.dll", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int tkm_save_weights(
+        IntPtr rt, [MarshalAs(UnmanagedType.LPStr)] string path);
+
+    [DllImport("tkm.dll", CallingConvention = CallingConvention.Cdecl)]
     internal static extern void tkm_runtime_free(IntPtr rt);
 }
 
 using var model = new RuntimeHandle("models/resnet_mnist.tkm", 1);
+if (Tokamak.tkm_load_weights(model.Ptr, "resnet-start.bin") == 0)
+    throw new InvalidOperationException("checkpoint load failed");
 float[] input = new float[(int)Tokamak.tkm_runtime_input_elements(model.Ptr)];
 int outputCount = checked((int)Tokamak.tkm_runtime_output_elements(model.Ptr));
 float[] output = new float[Math.Max(outputCount, 1)];
 if (outputCount != 0)
     Tokamak.tkm_runtime_forward(model.Ptr, input, output, (nuint)outputCount);
+if (Tokamak.tkm_save_weights(model.Ptr, "resnet-after-forward.bin") == 0)
+    throw new InvalidOperationException("checkpoint save failed");
 ```
 
 The `RuntimeHandle` in a real C# binding should implement `IDisposable` and
