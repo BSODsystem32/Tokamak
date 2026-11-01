@@ -48,7 +48,7 @@ compiler and the libraries included in the SDK:
 # Linux
 gcc app.c -Iinclude lib/libtkm.a \
   -Llib -lcudart -lnvrtc -lcuda -lcublas -lcublasLt \
-  -ldl -lpthread -lstdc++ -Wl,-rpath,'$ORIGIN/lib' -o app
+  -ldl -lpthread -lm -lstdc++ -Wl,-rpath,'$ORIGIN/lib' -o app
 
 # Windows (from the SDK root and an x64 Native Tools Command Prompt)
 cl app.c /I include lib\tkm_static.lib lib\cudart.lib lib\nvrtc.lib \
