@@ -350,6 +350,75 @@ non-null. On success, `written` equals the exact checkpoint size.
 each tensor length before copying weights to the GPU. The caller retains
 ownership of the input bytes and may release them after return.
 
+#### Training and inference lifecycle
+
+Weights are loaded **after** the model DSL creates a runtime and **before** the
+first forward, evaluation, or training call. Saving is normally done after a
+training step or epoch:
+
+```c
+TkmRuntime *rt = tkm_load_file("models/resnet_mnist.tkm", 64);
+if (!rt) return 1;
+
+/* Optional: resume from a previous checkpoint before consuming data. */
+if (resume_path && !tkm_load_weights(rt, resume_path)) {
+    tkm_runtime_free(rt);
+    return 1;
+}
+
+for (int epoch = 0; epoch < epochs; ++epoch) {
+    float average_loss = 0.0f;
+    if (!tkm_runtime_train_dataset(rt, next_batch, &loader,
+                                   batches_per_epoch, 1e-3f,
+                                   &average_loss)) {
+        tkm_runtime_free(rt);
+        return 1;
+    }
+
+    /* Save only after the epoch has completed successfully. */
+    if (checkpoint_path && !tkm_save_weights(rt, checkpoint_path)) {
+        tkm_runtime_free(rt);
+        return 1;
+    }
+}
+
+tkm_runtime_free(rt);
+```
+
+For pure inference, create the runtime, load the checkpoint, then call
+`tkm_runtime_forward` for a tensor-output graph or `tkm_runtime_eval` for a
+loss/classification graph:
+
+```c
+TkmRuntime *rt = tkm_load_file("models/llama3_style.tkm", 1);
+if (!rt || !tkm_load_weights(rt, "llama3-trained.bin")) {
+    tkm_runtime_free(rt);
+    return 1;
+}
+
+size_t input_n = tkm_runtime_input_elements(rt);
+size_t output_n = tkm_runtime_output_elements(rt);
+float *input = calloc(input_n, sizeof(float));
+float *logits = malloc(output_n * sizeof(float));
+size_t written = tkm_runtime_forward(rt, input, logits, output_n);
+if (written != output_n) {
+    /* Report inference failure. */
+}
+free(logits);
+free(input);
+tkm_runtime_free(rt);
+```
+
+The current checkpoint contains the learnable master tensors and restores
+their device copies. It does **not** contain optimizer velocity, random
+generator state, or an epoch/data-loader cursor. Loading a checkpoint resumes
+from the same model weights, but not from a bit-for-bit identical optimizer
+trajectory. Store epoch, learning-rate schedule, RNG seed, and dataset cursor
+in the host application's own metadata if exact job resumption is required.
+
+Do not load a checkpoint from one graph into another graph with a different
+learnable tensor count or shape. The runtime rejects those mismatches.
+
 ### 6.5 Dataset callbacks
 
 ```c
