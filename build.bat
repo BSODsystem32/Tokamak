@@ -24,6 +24,7 @@ if errorlevel 1 (
 :msvc_ready
 if "%ARCH%"=="" set ARCH=-arch=sm_86
 set FLAGS=-O3 -allow-unsupported-compiler -Xcompiler "/O2 /W3 /utf-8 /wd4819 /wd4996 /D_CRT_SECURE_NO_WARNINGS" -Xlinker "/STACK:8388608 /DELAYLOAD:nvcuda.dll" -ldelayimp -Iinclude
+set STATIC_FLAGS=-O3 -allow-unsupported-compiler -Xcompiler "/O2 /W3 /utf-8 /wd4819 /wd4996 /D_CRT_SECURE_NO_WARNINGS" -Iinclude
 
 if exist src\tkm.rc (
     where rc.exe >nul 2>nul
@@ -43,7 +44,7 @@ if exist src\tkm.rc (
     set RES_FILE=
 )
 
-echo [Tokamak] 1/3 Building standalone executable tkm.exe...
+echo [Tokamak] 1/4 Building standalone executable tkm.exe...
 nvcc %FLAGS% %ARCH% ^
     src\tkm_registry.c ^
     src\tkm_core.c ^
@@ -59,7 +60,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [Tokamak] 2/3 Building shared library tkm.dll (+ tkm.lib)...
+echo [Tokamak] 2/4 Building shared library tkm.dll (+ tkm.lib)...
 nvcc --shared %FLAGS% -DTKM_BUILD_DLL %ARCH% ^
     src\tkm_registry.c ^
     src\tkm_core.c ^
@@ -73,7 +74,20 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [Tokamak] 3/3 Building MNIST IDX C ABI example mnist_idx.exe...
+echo [Tokamak] 3/4 Building static library tkm_static.lib...
+nvcc --lib %STATIC_FLAGS% %ARCH% ^
+    src\tkm_registry.c ^
+    src\tkm_core.c ^
+    src\tkm_codegen.c ^
+    src\tkm_gpu.cu ^
+    -o tkm_static.lib
+
+if %ERRORLEVEL% neq 0 (
+    echo [Error] tkm_static.lib build failed!
+    exit /b 1
+)
+
+echo [Tokamak] 4/4 Building C ABI examples...
 cl.exe /nologo /O2 /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS /DTKM_USE_DLL /Iinclude ^
     examples\mnist_idx.c tkm.lib ^
     /Fe:mnist_idx.exe
@@ -83,5 +97,19 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
+cl.exe /nologo /O2 /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS /Iinclude ^
+    examples\mnist_idx.c tkm_static.lib ^
+    "%CUDA_PATH%\lib\x64\cudart.lib" ^
+    "%CUDA_PATH%\lib\x64\nvrtc.lib" ^
+    "%CUDA_PATH%\lib\x64\cuda.lib" ^
+    "%CUDA_PATH%\lib\x64\cublas.lib" ^
+    "%CUDA_PATH%\lib\x64\cublasLt.lib" ^
+    /Fe:mnist_idx_static.exe
+
+if %ERRORLEVEL% neq 0 (
+    echo [Error] Static C ABI link check failed!
+    exit /b 1
+)
+
 echo.
-echo [Success] Built tkm.exe, tkm.dll (+ tkm.lib), and mnist_idx.exe!
+echo [Success] Built tkm.exe, tkm.dll (+ import library), tkm_static.lib, and both C ABI examples!

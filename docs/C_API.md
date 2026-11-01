@@ -2,21 +2,65 @@
 
 Tokamak exports a small host-side C ABI through `include/tkm.h`. A caller includes
 that header and passes ordinary host pointers to the runtime API; the caller does
-not need CUDA headers or CUDA types. The Tokamak DLL/shared library itself still
-requires the CUDA runtime, NVRTC, the CUDA driver, and cuBLAS at run time.
+not need CUDA headers or CUDA types. The dynamic and static libraries both
+require CUDA runtime libraries, NVRTC,
+the CUDA driver, and cuBLAS at run time. The static SDK release bundle includes
+the redistributable CUDA runtime/NVRTC/cuBLAS libraries and host-link libraries,
+so consumers do not need to install the full CUDA Toolkit. An NVIDIA driver
+must still be installed on the target machine.
+
+## Release Packages
+
+The executable/runtime bundles (`tkm-windows-x64.zip` and `tkm-linux-x64.tar.gz`)
+include the CLI and model files. The separate static SDK bundles
+(`tkm-sdk-windows-x64.zip` and `tkm-sdk-linux-x64.tar.gz`) contain the public
+header, Tokamak static archive, required CUDA runtime libraries, and host-link
+libraries, without the CLI or model files:
+
+| Platform | Static library |
+|---|---|
+| Windows x64 | `lib/tkm_static.lib` plus CUDA host-link libraries; required DLLs are in `bin/` |
+| Linux x64 | `lib/libtkm.a` plus CUDA runtime/link libraries in `lib/` |
+
+The static archive removes the Tokamak DLL/shared-library deployment step. The
+SDK bundle includes the CUDA runtime pieces needed to link and run without a
+full Toolkit installation; it does not include the NVIDIA driver.
 
 ## Build
 
 On Windows, run `build.bat` from an x64 Native Tools Command Prompt for VS. The
 script also attempts to initialize the MSVC x64 environment automatically when
-run from a normal shell. It builds `tkm.dll`, `tkm.lib`, and `mnist_idx.exe`.
+run from a normal shell. It builds `tkm.dll`, its import library `tkm.lib`, the
+static archive `tkm_static.lib`, and C ABI example programs linked against both.
 
-On Linux, build the shared library and example with:
+On Linux, build both libraries and the C ABI examples with:
 
 ```sh
 make -j
 make mnist_idx
+make mnist_idx_static
 ```
+
+To link an application against a downloaded static SDK, use the platform host
+compiler and the libraries included in the SDK:
+
+```sh
+# Linux
+gcc app.c -Iinclude lib/libtkm.a \
+  -Llib -lcudart -lnvrtc -lcuda -lcublas -lcublasLt \
+  -ldl -lpthread -lm -lstdc++ -Wl,-rpath,'$ORIGIN/lib' -o app
+
+# Windows (from the SDK root and an x64 Native Tools Command Prompt)
+cl app.c /I include lib\tkm_static.lib lib\cudart.lib lib\nvrtc.lib \
+  lib\cuda.lib lib\cublas.lib lib\cublasLt.lib /Fe:app.exe
+```
+
+On Windows, put the SDK's `bin/` directory next to the executable or on `PATH`.
+On Linux, retain the shown rpath (run the command from the SDK root) or set
+`LD_LIBRARY_PATH` to the SDK's `lib/` directory. The Linux SDK includes the
+CUDA `libcuda.so` stub required for linking; it is not a driver runtime. The
+actual driver (`nvcuda.dll` / `libcuda.so.1`) comes from the installed NVIDIA
+driver and is intentionally not bundled.
 
 Keep the built library, CUDA runtime dependencies, and model file available when
 running an application that uses the ABI. The example loads

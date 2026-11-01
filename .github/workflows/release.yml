@@ -20,8 +20,10 @@ jobs:
         include:
           - os: windows-2022
             artifact_name: tkm-windows-x64.zip
+            sdk_artifact_name: tkm-sdk-windows-x64.zip
           - os: ubuntu-22.04
             artifact_name: tkm-linux-x64.tar.gz
+            sdk_artifact_name: tkm-sdk-linux-x64.tar.gz
 
     steps:
       - name: Checkout Source
@@ -47,13 +49,27 @@ jobs:
           export PATH="/usr/local/cuda-12.6/bin:$PATH"
           export LD_LIBRARY_PATH="/usr/local/cuda-12.6/lib64:/usr/local/cuda-12.6/lib64/stubs:$LD_LIBRARY_PATH"
           make -j
+          make mnist_idx_static
           test -f tkm
+          test -f libtkm.a
           mkdir -p dist/include dist/models
+          mkdir -p dist-sdk/include dist-sdk/lib
           cp tkm dist/
           cp include/*.h dist/include/
           cp models/*.tkm dist/models/
           cp README* dist/
           tar -czvf tkm-linux-x64.tar.gz -C dist .
+          cp include/tkm.h dist-sdk/include/
+          cp libtkm.a dist-sdk/lib/
+          cp -L /usr/local/cuda-12.6/lib64/lib{cudart,nvrtc,nvrtc-builtins,cublas,cublasLt}.so* dist-sdk/lib/
+          cp -L /usr/local/cuda-12.6/lib64/stubs/libcuda.so dist-sdk/lib/
+          test -f dist-sdk/lib/libcudart.so
+          test -f dist-sdk/lib/libnvrtc.so
+          test -f dist-sdk/lib/libnvrtc-builtins.so.12.6
+          test -f dist-sdk/lib/libcublas.so
+          test -f dist-sdk/lib/libcublasLt.so
+          test -f dist-sdk/lib/libcuda.so
+          tar -czf tkm-sdk-linux-x64.tar.gz -C dist-sdk .
 
       - name: Install CUDA 12.6 on Windows
         if: runner.os == 'Windows'
@@ -77,6 +93,7 @@ jobs:
         run: |
           call build.bat
           if not exist tkm.exe exit /b 1
+          if not exist tkm_static.lib exit /b 1
           mkdir dist
           copy tkm.exe dist\
           copy tkm.dll dist\
@@ -93,12 +110,45 @@ jobs:
           copy models\*.tkm dist\models\
           copy README* dist\
           tar -a -c -f tkm-windows-x64.zip -C dist *
+          mkdir dist-sdk
+          mkdir dist-sdk\include
+          mkdir dist-sdk\lib
+          mkdir dist-sdk\bin
+          copy include\tkm.h dist-sdk\include\
+          copy tkm_static.lib dist-sdk\lib\
+          copy "%CUDA_PATH%\lib\x64\cudart.lib" dist-sdk\lib\
+          copy "%CUDA_PATH%\lib\x64\nvrtc.lib" dist-sdk\lib\
+          copy "%CUDA_PATH%\lib\x64\cuda.lib" dist-sdk\lib\
+          copy "%CUDA_PATH%\lib\x64\cublas.lib" dist-sdk\lib\
+          copy "%CUDA_PATH%\lib\x64\cublasLt.lib" dist-sdk\lib\
+          copy "%CUDA_PATH%\bin\cudart64_*.dll" dist-sdk\bin\
+          copy "%CUDA_PATH%\bin\nvrtc64_*.dll" dist-sdk\bin\
+          copy "%CUDA_PATH%\bin\nvrtc-builtins64_*.dll" dist-sdk\bin\
+          copy "%CUDA_PATH%\bin\cublas64_*.dll" dist-sdk\bin\
+          copy "%CUDA_PATH%\bin\cublasLt64_*.dll" dist-sdk\bin\
+          if not exist dist-sdk\lib\cudart.lib exit /b 1
+          if not exist dist-sdk\lib\nvrtc.lib exit /b 1
+          if not exist dist-sdk\lib\cuda.lib exit /b 1
+          if not exist dist-sdk\lib\cublas.lib exit /b 1
+          if not exist dist-sdk\lib\cublasLt.lib exit /b 1
+          if not exist dist-sdk\bin\cudart64_*.dll exit /b 1
+          if not exist dist-sdk\bin\nvrtc64_*.dll exit /b 1
+          if not exist dist-sdk\bin\nvrtc-builtins64_*.dll exit /b 1
+          if not exist dist-sdk\bin\cublas64_*.dll exit /b 1
+          if not exist dist-sdk\bin\cublasLt64_*.dll exit /b 1
+          tar -a -c -f tkm-sdk-windows-x64.zip -C dist-sdk *
 
       - name: Upload Artifact to Workflow
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}
+
+      - name: Upload Static SDK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.sdk_artifact_name }}
+          path: ${{ matrix.sdk_artifact_name }}
 
   publish-github-release:
     name: Publish Release on GitHub
@@ -115,12 +165,26 @@ jobs:
         with:
           name: tkm-linux-x64.tar.gz
 
+      - name: Download Windows Static SDK
+        uses: actions/download-artifact@v4
+        with:
+          name: tkm-sdk-windows-x64.zip
+          path: windows-sdk
+
+      - name: Download Linux Static SDK
+        uses: actions/download-artifact@v4
+        with:
+          name: tkm-sdk-linux-x64.tar.gz
+          path: linux-sdk
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             tkm-windows-x64.zip
             tkm-linux-x64.tar.gz
+            windows-sdk/tkm-sdk-windows-x64.zip
+            linux-sdk/tkm-sdk-linux-x64.tar.gz
           generate_release_notes: true
           draft: false
           prerelease: false

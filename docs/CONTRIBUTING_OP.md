@@ -1,11 +1,20 @@
 # Contributor Guide: Adding Custom Operators to Tokamak
 
-Tokamak is built on a **Single-File Registration Architecture**. To contribute a new operator, activation function, or fusion rule, **you only ever edit `src/tkm_registry.c`**. You do not need to modify the parser, memory planner, or GPU execution runtime.
+Tokamak uses a central operator registry, but the single-file path applies to
+operators that fit the existing execution model. A new pointwise `CAT_FLUID`
+operator can be registered in `src/tkm_registry.c` using scalar math formulas;
+the engine generates the CUDA expressions and applies the derivative to the
+incoming gradient.
+Structural operators, reductions, normalizations, and terminal losses may need
+new enum values and dedicated code generation or runtime kernels; the existing
+Softmax and loss operators are examples of those runtime-specialized cases.
 
 ---
 
-## Step 1: Open `include/tkm.h`
-Add your new operator enum to `TkmOpType`:
+## Step 1: Add an enum only for runtime-specialized operators
+For an operator that needs dedicated execution code, add its enum to `TkmOpType`
+in `include/tkm.h`. Math-defined pointwise `CAT_FLUID` operators use the shared
+`OP_USER_FLUID` value and do not need this step.
 ```c
 typedef enum {
     ...
@@ -17,28 +26,35 @@ typedef enum {
 ---
 
 ## Step 2: Open `src/tkm_registry.c`
-Add a single entry to the `TKM_OP_REGISTRY[]` table.
+Register the operator in `TKM_OP_REGISTRY[]`. For a math-defined pointwise
+operator, this is the only implementation file that needs to change.
 
-### Case A: Adding a Pure Pointwise Activation
-Example: Adding **Swish-Beta** ($x \cdot \sigma(\beta x)$):
+### Case A: Adding a Pure Pointwise Activation Without CUDA
+Example: Adding **Softplus**, with a scalar forward formula and its derivative:
 ```c
 {
-    OP_SWISH_BETA,
-    "SwishBeta",        // Keyword used in .tkm markup
-    CAT_FLUID,          // Fusable into registers
-    RES_NONE,           // Requires no extra parameters or buffers
-    1.5f,               // Default hyperparameter fval (Beta)
-    /* Forward CUDA */
-    "float sx = 1.0f / (1.0f + __expf(-fval * v.x)), sy = 1.0f / (1.0f + __expf(-fval * v.y));\n"
-    "v = make_float2(v.x * sx, v.y * sy);",
-    /* Backward CUDA (Variable `pre` is automatically replayed in registers!) */
-    "float sx = 1.0f / (1.0f + __expf(-fval * pre.x)), sy = 1.0f / (1.0f + __expf(-fval * pre.y));\n"
-    "dy.x *= sx * (1.0f + fval * pre.x * (1.0f - sx));\n"
-    "dy.y *= sy * (1.0f + fval * pre.y * (1.0f - sy));"
+    OP_USER_FLUID, "Softplus", CAT_FLUID, RES_NONE, 0.0f,
+    NULL, NULL,
+    "log(1 + exp(x))",
+    "1 / (1 + exp(-x))"
 }
 ```
 
-### Case B: Adding a Parameterized Layer with Learnable Weights
+The expression variable `x` represents one scalar channel value. Supported
+functions are `exp`, `log`/`ln`, `sqrt`, `sin`, `cos`, `tanh`, `abs`, `max`,
+`min`, and `pow`; arithmetic, parentheses, `fval`, and `pi` are also available.
+Write the scalar derivative `d output / d x`; the generated kernel multiplies
+it by the back-propagated gradient. Formula registration avoids CUDA syntax but
+still requires the contributor to provide the mathematically correct derivative.
+For research-derived operators, credit the source paper in a short comment beside
+the registry entry and in the operator documentation. For example, Snake as used
+in BigVGAN (Sang-gil Lee et al., “[BigVGAN: A Universal Neural Vocoder with Large-Scale Training](https://arxiv.org/abs/2206.04658),” ICLR 2023)
+has $f_\alpha(x)=x+\sin^2(\alpha x)/\alpha$ and
+$f'_\alpha(x)=1+\sin(2\alpha x)$; use a positive `alpha` (`fval`).
+
+### Case B: Advanced CUDA-Backed Parameters
+Parameterized kernels with learnable weights can still use the lower-level
+CUDA snippet interface. For example, learnable PReLU:
 Example: Adding **Learnable PReLU** ($x > 0 \ ? \ x : w_c \cdot x$, with per-channel learnable $w_c$ vector):
 ```c
 {
@@ -71,7 +87,7 @@ Run the automated finite-difference calculus verification suite:
 ```cmd
 tkm.exe numcheck
 ```
-If your analytical CUDA backward snippet mathematically matches the 2-point secant slope limit $\frac{\mathcal{L}(x+\epsilon) - \mathcal{L}(x-\epsilon)}{2\epsilon}$, it will output `PASS` with relative error $< 10^{-4}$.
+If the analytical backward derivative matches the 2-point secant slope limit $\frac{\mathcal{L}(x+\epsilon) - \mathcal{L}(x-\epsilon)}{2\epsilon}$, it will output `PASS` with relative error $< 10^{-4}$.
 
 You can now submit your PR with confidence!
 ```

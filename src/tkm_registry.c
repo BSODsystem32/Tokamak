@@ -3,12 +3,14 @@
 
 /*
  * src/tkm_registry.c -- Complete Contributor Operator & Fusion Rule Registry
- *   42 Operators + 4 Structural/Algebraic Peephole Fusion Rules!
+ *   Operator Specs + 4 Structural/Algebraic Peephole Fusion Rules
  */
 #include "tkm.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 const char *tkm_rng_name(TkmRngType r) {
     switch (r) {
@@ -385,8 +387,22 @@ static const TkmOpSpec TKM_OP_REGISTRY[] = {
         "float2 sk = __half22float2(__ldg(&branch_in[idx2])); v.x += sk.x; v.y += sk.y;",
         "dbranch_out[idx2] = __float22half2_rn(dy);"
     },
-    { OP_MUL,        "Mul",       CAT_FLUID,  RES_NONE, 0.0f, NULL, NULL },
-    { OP_SOFTMAX_CE, "SoftmaxCE", CAT_ANCHOR, RES_NONE, 0.0f, NULL, NULL }
+    { OP_MUL,            "Mul",         CAT_FLUID,  RES_NONE, 0.0f, NULL, NULL },
+    { OP_SOFTMAX,         "Softmax",     CAT_ANCHOR, RES_NONE, 0.0f, NULL, NULL },
+    { OP_SOFTMAX_CE,      "SoftmaxCE",   CAT_ANCHOR, RES_NONE, 0.0f, NULL, NULL },
+    { OP_SOFTMAX_FOCAL,   "SoftmaxFocal",CAT_ANCHOR, RES_NONE, 2.0f, NULL, NULL },
+    { OP_SOFTMAX_MSE,     "SoftmaxMSE",  CAT_ANCHOR, RES_NONE, 0.0f, NULL, NULL },
+    {
+        OP_USER_FLUID, "Softplus", CAT_FLUID, RES_NONE, 0.0f, NULL, NULL,
+        "log(1.0 + exp(x))",
+        "1.0 / (1.0 + exp(-x))"
+    },
+    /* Snake activation as used in BigVGAN (Lee et al., ICLR 2023; arXiv:2206.04658). */
+    {
+        OP_USER_FLUID, "Snake", CAT_FLUID, RES_NONE, 1.0f, NULL, NULL,
+        "x + sin(fval * x) * sin(fval * x) / fval",
+        "1.0 + sin(2.0 * fval * x)"
+    }
 };
 
 #define NUM_OP_SPECS (sizeof(TKM_OP_REGISTRY) / sizeof(TKM_OP_REGISTRY[0]))
@@ -398,8 +414,158 @@ const TkmOpSpec *tkm_find_spec_by_op(TkmOpType op) {
     return NULL;
 }
 
+const TkmOpSpec *tkm_find_spec_by_index(int index) {
+    if (index < 0 || (size_t)index >= NUM_OP_SPECS) return NULL;
+    return &TKM_OP_REGISTRY[index];
+}
+
+const TkmOpSpec *tkm_find_spec_by_node(const TkmNode *node) {
+    if (!node) return NULL;
+    if (node->op == OP_USER_FLUID) return tkm_find_spec_by_index(node->spec_id);
+    return tkm_find_spec_by_op(node->op);
+}
+
+int tkm_get_spec_index(const TkmOpSpec *spec) {
+    if (!spec) return -1;
+    for (size_t i = 0; i < NUM_OP_SPECS; i++) {
+        if (spec == &TKM_OP_REGISTRY[i]) return (int)i;
+    }
+    return -1;
+}
+
+int tkm_get_spec_count(void) {
+    return (int)NUM_OP_SPECS;
+}
+
+typedef struct {
+    const char *p;
+    float x;
+    float fval;
+    int failed;
+} MathExprParser;
+
+static void math_expr_skip_ws(MathExprParser *parser) {
+    while (isspace((unsigned char)*parser->p)) parser->p++;
+}
+
+static float math_expr_parse_sum(MathExprParser *parser);
+
+static float math_expr_parse_primary(MathExprParser *parser) {
+    math_expr_skip_ws(parser);
+    if (*parser->p == '(') {
+        parser->p++;
+        float value = math_expr_parse_sum(parser);
+        math_expr_skip_ws(parser);
+        if (*parser->p != ')') parser->failed = 1;
+        else parser->p++;
+        return value;
+    }
+
+    if (isdigit((unsigned char)*parser->p) || *parser->p == '.') {
+        char *end = NULL;
+        float value = strtof(parser->p, &end);
+        if (end == parser->p) parser->failed = 1;
+        else parser->p = end;
+        return value;
+    }
+
+    if (isalpha((unsigned char)*parser->p) || *parser->p == '_') {
+        char name[32];
+        int len = 0;
+        while ((isalnum((unsigned char)*parser->p) || *parser->p == '_') && len < (int)sizeof(name) - 1) {
+            name[len++] = *parser->p++;
+        }
+        name[len] = '\0';
+        math_expr_skip_ws(parser);
+        if (*parser->p != '(') {
+            if (!strcmp(name, "x")) return parser->x;
+            if (!strcmp(name, "fval")) return parser->fval;
+            if (!strcmp(name, "pi")) return 3.14159265358979323846f;
+            parser->failed = 1;
+            return 0.0f;
+        }
+
+        parser->p++;
+        float a = math_expr_parse_sum(parser);
+        math_expr_skip_ws(parser);
+        int has_b = (*parser->p == ',');
+        float b = 0.0f;
+        if (has_b) {
+            parser->p++;
+            b = math_expr_parse_sum(parser);
+        }
+        math_expr_skip_ws(parser);
+        if (*parser->p != ')') parser->failed = 1;
+        else parser->p++;
+
+        if (!strcmp(name, "exp") && !has_b) return expf(a);
+        if ((!strcmp(name, "log") || !strcmp(name, "ln")) && !has_b) return logf(a);
+        if (!strcmp(name, "sqrt") && !has_b) return sqrtf(a);
+        if (!strcmp(name, "sin") && !has_b) return sinf(a);
+        if (!strcmp(name, "cos") && !has_b) return cosf(a);
+        if (!strcmp(name, "tanh") && !has_b) return tanhf(a);
+        if (!strcmp(name, "abs") && !has_b) return fabsf(a);
+        if (!strcmp(name, "max") && has_b) return fmaxf(a, b);
+        if (!strcmp(name, "min") && has_b) return fminf(a, b);
+        if (!strcmp(name, "pow") && has_b) return powf(a, b);
+        parser->failed = 1;
+        return 0.0f;
+    }
+
+    parser->failed = 1;
+    return 0.0f;
+}
+
+static float math_expr_parse_unary(MathExprParser *parser) {
+    math_expr_skip_ws(parser);
+    if (*parser->p == '+') {
+        parser->p++;
+        return math_expr_parse_unary(parser);
+    }
+    if (*parser->p == '-') {
+        parser->p++;
+        return -math_expr_parse_unary(parser);
+    }
+    return math_expr_parse_primary(parser);
+}
+
+static float math_expr_parse_product(MathExprParser *parser) {
+    float value = math_expr_parse_unary(parser);
+    while (!parser->failed) {
+        math_expr_skip_ws(parser);
+        char op = *parser->p;
+        if (op != '*' && op != '/') break;
+        parser->p++;
+        float rhs = math_expr_parse_unary(parser);
+        value = op == '*' ? value * rhs : value / rhs;
+    }
+    return value;
+}
+
+static float math_expr_parse_sum(MathExprParser *parser) {
+    float value = math_expr_parse_product(parser);
+    while (!parser->failed) {
+        math_expr_skip_ws(parser);
+        char op = *parser->p;
+        if (op != '+' && op != '-') break;
+        parser->p++;
+        float rhs = math_expr_parse_product(parser);
+        value = op == '+' ? value + rhs : value - rhs;
+    }
+    return value;
+}
+
+int tkm_eval_math_expr(const char *expr, float x, float fval, float *out_value) {
+    if (!expr || !out_value) return 0;
+    MathExprParser parser = { expr, x, fval, 0 };
+    float value = math_expr_parse_sum(&parser);
+    math_expr_skip_ws(&parser);
+    if (parser.failed || *parser.p) return 0;
+    *out_value = value;
+    return 1;
+}
+
 const TkmOpSpec *tkm_find_spec_by_name(const char *dsl_name) {
-    if (!strcmp(dsl_name, "Softmax")) return tkm_find_spec_by_op(OP_SOFTMAX_CE);
     for (size_t i = 0; i < NUM_OP_SPECS; i++) {
         if (!strcmp(TKM_OP_REGISTRY[i].dsl_name, dsl_name)) return &TKM_OP_REGISTRY[i];
     }

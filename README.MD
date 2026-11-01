@@ -29,7 +29,7 @@ You write your model architecture in a clean `.tkm` markup DSL. Tokamak parses t
 * **100% Deadlock-Free Sub-Warp Reduction**: Guaranteed convergence across arbitrary channel counts without intra-warp divergence.
 * **Hardware Tensor Core (WMMA 16x16x16) GQA FlashAttention-2**: Hardware `mma_sync` acceleration for both Forward and Backward attention matrices with bank-conflict-free shared memory.
 * **Multi-Scheme PRNG Engine**: Built-in support for `pcg32`, `philox4x32_7`, `wang_xorshift32`, and `xorshift32`—selectable globally or per-operator.
-* **Contributor-Friendly Registry (`src/tkm_registry.c`)**: Add a new research operator or fusion rule in **ONE single file** without touching the parser, memory planner, or GPU runtime.
+* **Math-Defined Custom Kernels (`src/tkm_registry.c`)**: Add supported pointwise research operators with scalar forward and derivative formulas; the engine emits the CUDA kernel, so no CUDA code or new enum is required. Reductions, standalone Softmax, and loss sinks remain runtime-specialized.
 
 ---
 
@@ -101,7 +101,7 @@ tkm/
 ├── docs/
 │   └── C_API.md          # Host-side C ABI and MNIST IDX walkthrough
 ├── src/
-│   ├── tkm_registry.c    # [Contributor Hub] All 42 Operator Specs & Fusion Rules live here!
+│   ├── tkm_registry.c    # [Contributor Hub] Operator Specs & Fusion Rules
 │   ├── tkm_core.c        # DSL Parser, Loop Macro Expander, Shape Inference & Arena Planner
 │   ├── tkm_codegen.c     # Table-Driven Bi-Directional NVRTC CUDA C++ Generator
 │   ├── tkm_gpu.cu        # WMMA FlashAttention, In-Memory NVRTC, CUDA Graph Engine
@@ -123,13 +123,13 @@ Open `x64 Native Tools Command Prompt for VS` and run:
 ```cmd
 build.bat
 ```
-This builds **`tkm.exe`** (CLI executable with an optional embedded icon), **`tkm.dll` / `tkm.lib`** (shared library), and **`mnist_idx.exe`** (standalone C ABI example).
+This builds **`tkm.exe`** (CLI executable with an optional embedded icon), **`tkm.dll` / `tkm.lib`** (shared library and import library), **`tkm_static.lib`** (static SDK library), and C ABI examples linked against both library types.
 
 ### Linux (GCC + CUDA 11.6 ~ 13.x)
 ```bash
 make -j
 ```
-This builds the CLI and `libtkm.so`; build the external MNIST IDX caller with `make mnist_idx`.
+This builds the CLI, `libtkm.so`, and `libtkm.a`. Build the dynamic and static MNIST IDX callers with `make mnist_idx` and `make mnist_idx_static`, respectively.
 
 ---
 
@@ -183,6 +183,8 @@ tkm.exe inspect models/exotic_llama.tkm --batch 32 --emit generated_llama.cu
 
 You can embed Tokamak into any host application using the exported API. The caller only includes `tkm.h` and passes ordinary host pointers; it does not need CUDA headers or CUDA types. `examples/mnist_idx.c` is a complete MNIST IDX caller that trains `models/resnet_mnist.tkm` and evaluates on the IDX test set.
 
+Release downloads provide independent choices: the executable/runtime bundle (`tkm-windows-x64.zip` or `tkm-linux-x64.tar.gz`) for users who want the CLI and model files, and a static SDK bundle (`tkm-sdk-windows-x64.zip` or `tkm-sdk-linux-x64.tar.gz`) for embedding Tokamak into a host application. The SDK includes `include/tkm.h`, the platform static library, the minimal CUDA runtime/NVRTC/cuBLAS libraries, and the link libraries needed by the host compiler; it does not require the full CUDA Toolkit to build or run the host application. An NVIDIA driver is still required at runtime. See [docs/C_API.md](docs/C_API.md) for link commands and deployment details.
+
 ```c
 #include "tkm.h"
 
@@ -210,30 +212,25 @@ With batch size 1024 and 30 epochs, one run reported train loss `0.1206` and tes
 
 ---
 
-## 🤝 How to Contribute an Operator (Single-File PR!)
+## 🤝 How to Contribute an Operator
 
-To add a new mathematical activation, gating function, or normalization to Tokamak, **you only ever edit `src/tkm_registry.c`**.
+Supported pointwise `CAT_FLUID` activations and gating functions can be added by editing `src/tkm_registry.c` with scalar math formulas; the engine generates the CUDA kernel and derivative application. No CUDA code or new enum is needed. This path does not apply to reductions, standalone Softmax, or loss sinks, which need dedicated GPU runtime handling; see [docs/CONTRIBUTING_OP.md](docs/CONTRIBUTING_OP.md).
 
 Simply add one entry to `TKM_OP_REGISTRY[]`:
 
 ```c
-/* Example: Adding Learnable PReLU with private register accumulation */
+/* Example: Adding Softplus from math formulas (no CUDA source) */
 {
-    OP_PRELU,
-    "PReLU",             // Keyword in .tkm markup
-    CAT_FLUID,           // Categorized as fusable fluid
-    RES_PARAM_WEIGHT,    // Automatically allocates & binds w_vec + acc_dw
-    0.25f,               // Default hyperparameter fval
-    /* Forward CUDA */
-    "float2 w = w_vec[tid];\n"
-    "v.x = (v.x > 0.0f) ? v.x : (v.x * w.x * fval);\n"
-    "v.y = (v.y > 0.0f) ? v.y : (v.y * w.y * fval);",
-    /* Backward CUDA (Accumulates directly into local register acc_dw!) */
-    "float2 w = w_vec[tid];\n"
-    "if (pre.x <= 0.0f) acc_dw.x += dy.x * pre.x * fval;\n"
-    "if (pre.y <= 0.0f) acc_dw.y += dy.y * pre.y * fval;\n"
-    "dy.x *= (pre.x > 0.0f) ? 1.0f : (w.x * fval);\n"
-    "dy.y *= (pre.y > 0.0f) ? 1.0f : (w.y * fval);"
+    OP_USER_FLUID,
+    "Softplus",                    // Keyword used in .tkm markup
+    CAT_FLUID,
+    RES_NONE,
+    0.0f,
+    NULL, NULL,                    // No handwritten CUDA
+    "log(1 + exp(x))",             // Forward scalar formula
+    "1 / (1 + exp(-x))"            // Derivative with respect to x
 }
 ```
-Recompile with `build.bat` or `make`. Your new operator is now instantly available in `.tkm` DSL, mathematically auditable via `tkm.exe numcheck`, and fuses with arbitrary surrounding blocks!
+Expressions support `x`, `fval`, `pi`, arithmetic, parentheses, and the functions `exp`, `log`/`ln`, `sqrt`, `sin`, `cos`, `tanh`, `abs`, `max`, `min`, and `pow`. The derivative expression is multiplied by the incoming gradient automatically. Advanced operators that need parameters, reductions, or special memory behavior still require dedicated engine support; existing low-level CUDA snippets remain available for those cases. See [docs/CONTRIBUTING_OP.md](docs/CONTRIBUTING_OP.md) for the full authoring contract.
+
+Research-derived example: `Snake(1.7)` is registered as a formula-only pointwise operator, so it uses generated CUDA code and remains eligible for fluid fusion. Its formula is $x+\sin^2(\alpha x)/\alpha$; `alpha` must be positive. The implementation credits [BigVGAN (Lee et al., 2023)](https://arxiv.org/abs/2206.04658).

@@ -533,9 +533,42 @@ void k_gqa_flash_attn_tc_bwd(const __half * __restrict__ qkv, const __half * __r
     }
 }
 
-__global__ void k_softmax_ce_fwd_bwd_h(const __half * __restrict__ logits, const uint8_t * __restrict__ labels,
-                                       __half * __restrict__ dlogits, float * __restrict__ loss_acc,
-                                       int * __restrict__ corr_acc, int rows, int cols, int is_eval, int valid_rows) {
+__global__ void k_softmax_fwd_h(const __half * __restrict__ logits, __half * __restrict__ probs,
+                                int rows, int cols) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    float mx = -1e30f;
+    for (int c = 0; c < cols; c++) mx = fmaxf(mx, __half2float(logits[r * cols + c]));
+    float sum = 0.0f;
+    for (int c = 0; c < cols; c++) sum += expf(__half2float(logits[r * cols + c]) - mx);
+    for (int c = 0; c < cols; c++) {
+        float p = expf(__half2float(logits[r * cols + c]) - mx) / sum;
+        probs[r * cols + c] = __float2half(p);
+    }
+}
+
+__global__ void k_softmax_bwd_h(const __half * __restrict__ probs, const __half * __restrict__ dprobs,
+                                __half * __restrict__ dlogits, int rows, int cols) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    float dot = 0.0f;
+    for (int c = 0; c < cols; c++) {
+        int idx = r * cols + c;
+        dot += __half2float(probs[idx]) * __half2float(dprobs[idx]);
+    }
+    for (int c = 0; c < cols; c++) {
+        int idx = r * cols + c;
+        float p = __half2float(probs[idx]);
+        float dx = p * (__half2float(dprobs[idx]) - dot);
+        float prev = __half2float(dlogits[idx]);
+        dlogits[idx] = __float2half(prev + dx);
+    }
+}
+
+__global__ void k_softmax_loss_fwd_bwd_h(const __half * __restrict__ logits, const uint8_t * __restrict__ labels,
+                                         __half * __restrict__ dlogits, float * __restrict__ loss_acc,
+                                         int * __restrict__ corr_acc, int rows, int cols, int is_eval,
+                                         int valid_rows, int loss_kind, float gamma) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
     float mx = -1e30f;
@@ -551,10 +584,35 @@ __global__ void k_softmax_ce_fwd_bwd_h(const __half * __restrict__ logits, const
     if (is_eval) return;
 
     float inv_rows = 1.0f / (float)rows;
+    float target_prob = expf(__half2float(logits[r * cols + lbl]) - mx) / sum;
+    target_prob = fmaxf(target_prob, 1e-7f);
+    float focal_weight = powf(1.0f - target_prob, gamma);
+    float focal_grad_scale = loss_kind == 1
+        ? focal_weight - gamma * target_prob * powf(1.0f - target_prob, gamma - 1.0f) * logf(target_prob)
+        : 1.0f;
+    float brier_dot = 0.0f;
+    if (loss_kind == 2) {
+        for (int c = 0; c < cols; c++) {
+            float prob = expf(__half2float(logits[r * cols + c]) - mx) / sum;
+            brier_dot += prob * (prob - (c == lbl ? 1.0f : 0.0f));
+        }
+    }
     for (int c = 0; c < cols; c++) {
         float prob = expf(__half2float(logits[r * cols + c]) - mx) / sum;
-        if (c == lbl && loss_acc) atomicAdd(loss_acc, -logf(fmaxf(prob, 1e-7f)) * inv_rows);
-        float grad = (prob - (c == lbl ? 1.0f : 0.0f)) * inv_rows;
+        float target = c == lbl ? 1.0f : 0.0f;
+        float grad;
+        if (loss_kind == 0) {
+            if (c == lbl && loss_acc) atomicAdd(loss_acc, -logf(target_prob) * inv_rows);
+            grad = prob - target;
+        } else if (loss_kind == 1) {
+            if (c == lbl && loss_acc) atomicAdd(loss_acc, -focal_weight * logf(target_prob) * inv_rows);
+            grad = focal_grad_scale * (prob - target);
+        } else {
+            float diff = prob - target;
+            if (loss_acc) atomicAdd(loss_acc, (diff * diff / (float)cols) * inv_rows);
+            grad = (2.0f / (float)cols) * prob * (diff - brier_dot);
+        }
+        grad *= inv_rows;
         dlogits[r * cols + c] = __float2half(grad);
     }
 }
@@ -786,7 +844,7 @@ static void init_node_resources(TkmRuntime *rt, SgdTensorList *sgd, int nid) {
         CUDA_CHECK(cudaMalloc(&st->d_save_istd, (size_t)rows * n->q_heads * sizeof(float)));
     }
 
-    const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+    const TkmOpSpec *spec = tkm_find_spec_by_node(n);
     if (!spec) return;
     uint32_t f = spec->res_flags;
     if (f & RES_PARAM_BIAS)
@@ -1012,12 +1070,20 @@ static void execute_forward_pass(TkmRuntime *rt, int is_eval, int valid_examples
                 if (out_ptr != in_ptr)
                     CUDA_CHECK(cudaMemcpyAsync(out_ptr, in_ptr, n->out_bytes, cudaMemcpyDeviceToDevice, rt->stream));
                 break;
-            case OP_SOFTMAX_CE: {
+            case OP_SOFTMAX: {
+                k_softmax_fwd_h<<<(rows + 255) / 256, 256, 0, rt->stream>>>(
+                    (const __half*)in_ptr, (__half*)out_ptr, rows, n->C);
+                break;
+            }
+            case OP_SOFTMAX_CE:
+            case OP_SOFTMAX_FOCAL:
+            case OP_SOFTMAX_MSE: {
                 void *dout_ptr = rt->d_grad_arena + g->nodes[n->in0].out_offset;
-                k_softmax_ce_fwd_bwd_h<<<(rows + 255) / 256, 256, 0, rt->stream>>>(
+                int loss_kind = n->op == OP_SOFTMAX_FOCAL ? 1 : (n->op == OP_SOFTMAX_MSE ? 2 : 0);
+                k_softmax_loss_fwd_bwd_h<<<(rows + 255) / 256, 256, 0, rt->stream>>>(
                     (const __half*)in_ptr, rt->d_labels, (__half*)dout_ptr,
                     rt->d_loss_buf, rt->d_corr_buf, rows, n->C, is_eval,
-                    is_eval ? (valid_examples * rows + B - 1) / B : rows);
+                    is_eval ? (valid_examples * rows + B - 1) / B : rows, loss_kind, n->fval);
                 break;
             }
             default: break;
@@ -1042,7 +1108,8 @@ static void record_full_step_stream(TkmRuntime *rt) {
     int executed_grp[TKM_MAX_GROUPS] = {0};
     for (int i = g->num_nodes - 1; i >= 1; i--) {
         const TkmNode *n = &g->nodes[i];
-        if (n->dead || n->op == OP_SOFTMAX_CE) continue;
+        if (n->dead || n->op == OP_SOFTMAX_CE || n->op == OP_SOFTMAX_FOCAL ||
+            n->op == OP_SOFTMAX_MSE) continue;
 
         if (n->plasma_grp >= 0) {
             int gid = n->plasma_grp;
@@ -1121,6 +1188,10 @@ static void record_full_step_stream(TkmRuntime *rt) {
             case OP_FLATTEN:
                 if (din != dout)
                     CUDA_CHECK(cudaMemcpyAsync(din, dout, g->nodes[n->in0].out_bytes, cudaMemcpyDeviceToDevice, rt->stream));
+                break;
+            case OP_SOFTMAX:
+                k_softmax_bwd_h<<<(rows + 255) / 256, 256, 0, rt->stream>>>(
+                    (const __half*)out_act, (const __half*)dout, (__half*)din, rows, n->C);
                 break;
             default: break;
         }
