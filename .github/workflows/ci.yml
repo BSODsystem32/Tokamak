@@ -51,7 +51,7 @@ jobs:
           cp -L /usr/local/cuda-12.6/lib64/stubs/libcuda.so dist-sdk/lib/
           gcc -O2 -I dist-sdk/include examples/mnist_idx.c dist-sdk/lib/libtkm.a \
             -L dist-sdk/lib -lcudart -lnvrtc -lcuda -lcublas -lcublasLt \
-            -ldl -lpthread -lstdc++ -Wl,-rpath,'$ORIGIN/../lib' -o dist-sdk/mnist_idx_static_sdk
+            -ldl -lpthread -lstdc++ -Wl,-rpath,'$ORIGIN/lib' -o dist-sdk/mnist_idx_static_sdk
           ./tkm verify-registry
           ./tkm numcheck
           ./tkm inspect models/resnet_mnist.tkm --emit generated_resnet.cu

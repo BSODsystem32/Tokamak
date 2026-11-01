@@ -57,8 +57,10 @@ cl app.c /I include lib\tkm_static.lib lib\cudart.lib lib\nvrtc.lib \
 
 On Windows, put the SDK's `bin/` directory next to the executable or on `PATH`.
 On Linux, retain the shown rpath (run the command from the SDK root) or set
-`LD_LIBRARY_PATH` to the SDK's `lib/` directory. The CUDA driver library (`nvcuda.dll` / `libcuda.so.1`) comes from
-the installed NVIDIA driver and is intentionally not bundled.
+`LD_LIBRARY_PATH` to the SDK's `lib/` directory. The Linux SDK includes the
+CUDA `libcuda.so` stub required for linking; it is not a driver runtime. The
+actual driver (`nvcuda.dll` / `libcuda.so.1`) comes from the installed NVIDIA
+driver and is intentionally not bundled.
 
 Keep the built library, CUDA runtime dependencies, and model file available when
 running an application that uses the ABI. The example loads
