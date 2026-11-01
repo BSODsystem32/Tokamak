@@ -45,6 +45,7 @@ static int new_node(TkmGraph *g, const TkmOpSpec *spec, int in0, int in1, int in
     TkmNode *n = &g->nodes[id];
     memset(n, 0, sizeof(TkmNode));
     n->id = id;
+    n->spec_id = tkm_get_spec_index(spec);
     n->op = spec ? spec->op : OP_INPUT;
     n->cat = spec ? spec->cat : CAT_META;
     n->in0 = in0; n->in1 = in1; n->in2 = in2;
@@ -280,7 +281,7 @@ static void add_karg(TkmKernelSig *sig, TkmArgKind kind, int nid, int append_nid
 }
 
 static void bind_node_fwd_resources(TkmKernelSig *fs, const TkmNode *n) {
-    const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+    const TkmOpSpec *spec = tkm_find_spec_by_node(n);
     if (!spec) return;
     uint32_t f = spec->res_flags;
     if (f & RES_PARAM_BIAS)   add_karg(fs, KARG_BIAS,        n->id,  1, "const float2* __restrict__", "b_vec");
@@ -294,7 +295,7 @@ static void bind_node_fwd_resources(TkmKernelSig *fs, const TkmNode *n) {
 }
 
 static void bind_node_bwd_resources(TkmKernelSig *bs, const TkmNode *n) {
-    const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+    const TkmOpSpec *spec = tkm_find_spec_by_node(n);
     if (!spec) return;
     uint32_t f = spec->res_flags;
     if (f & RES_BRANCH_IN)    add_karg(bs, KARG_DBRANCH_OUT, n->in1, 1, "__half2* __restrict__",       "dbranch_out");
@@ -522,7 +523,7 @@ void tkm_dump_summary(const TkmGraph *g, FILE *out) {
     for (int i = 0; i < g->num_nodes; i++) {
         const TkmNode *n = &g->nodes[i];
         if (n->dead) continue;
-        const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+        const TkmOpSpec *spec = tkm_find_spec_by_node(n);
         const char *op_s = spec ? spec->dsl_name : "Input";
         char mem_s[96];
         if (n->out_buf_id < 0) {
@@ -541,19 +542,39 @@ void tkm_dump_summary(const TkmGraph *g, FILE *out) {
 int tkm_verify_registry(void) {
     int errors = 0;
     for (int i = 0; i < OP_COUNT; i++) {
+        if (i == OP_USER_FLUID) continue;
         const TkmOpSpec *spec = tkm_find_spec_by_op((TkmOpType)i);
         if (!spec) {
             fprintf(stderr, "[Registry Error] Op enum %d has no entry in TKM_OP_REGISTRY[]!\n", i);
             errors++;
-            continue;
         }
+    }
+    for (int i = 0; i < tkm_get_spec_count(); i++) {
+        const TkmOpSpec *spec = tkm_find_spec_by_index(i);
         if (spec->cat == CAT_NORM && !(spec->res_flags & RES_SAVE_XHAT)) {
             fprintf(stderr, "[Registry Error] Normalization op '%s' must declare RES_SAVE_XHAT!\n", spec->dsl_name);
             errors++;
         }
-        if (spec->cat == CAT_FLUID && spec->fwd_cuda && !spec->bwd_cuda) {
-            fprintf(stderr, "[Registry Error] Operator '%s' has fwd_cuda but missing bwd_cuda!\n", spec->dsl_name);
+        if (spec->cat == CAT_FLUID &&
+            ((spec->fwd_cuda || spec->fwd_expr) != (spec->bwd_cuda || spec->bwd_expr))) {
+            fprintf(stderr, "[Registry Error] Operator '%s' must provide both forward and backward definitions!\n", spec->dsl_name);
             errors++;
+        }
+        if ((spec->fwd_cuda && spec->fwd_expr) || (spec->bwd_cuda && spec->bwd_expr)) {
+            fprintf(stderr, "[Registry Error] Operator '%s' cannot mix CUDA snippets and math expressions per direction!\n", spec->dsl_name);
+            errors++;
+        }
+        if (spec->fwd_expr || spec->bwd_expr) {
+            const float probes[] = { -1.0f, 0.25f, 1.5f };
+            for (size_t p = 0; p < sizeof(probes) / sizeof(probes[0]); p++) {
+                float ignored;
+                if ((spec->fwd_expr && !tkm_eval_math_expr(spec->fwd_expr, probes[p], spec->default_fval, &ignored)) ||
+                    (spec->bwd_expr && !tkm_eval_math_expr(spec->bwd_expr, probes[p], spec->default_fval, &ignored))) {
+                    fprintf(stderr, "[Registry Error] Operator '%s' has an invalid math expression.\n", spec->dsl_name);
+                    errors++;
+                    break;
+                }
+            }
         }
     }
     return errors;

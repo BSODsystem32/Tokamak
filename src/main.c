@@ -56,6 +56,80 @@ static int is_numcheck_testable(TkmOpType op) {
     }
 }
 
+static int is_numcheck_testable_spec(const TkmOpSpec *spec) {
+    if (!spec) return 0;
+    if (spec->op == OP_USER_FLUID) return spec->fwd_expr && spec->bwd_expr;
+    return is_numcheck_testable(spec->op);
+}
+
+static int run_fused_user_fluid_check(void) {
+    static const char dsl[] =
+        "input: 1x1x8\n"
+        "flow:\n"
+        "  trunk: FC(8) -> Softplus -> FC(8) -> Tanh\n"
+        "  gate: {\n"
+        "    branch: FC(8) -> Softplus -> Scale(0.7)\n"
+        "    skip: FC(8) -> GELU\n"
+        "  } -> Mul -> Softplus -> FC(4) -> SoftmaxCE\n";
+    const int batch = 4;
+    float input[32] = {
+        0.4f, -0.2f, 0.8f, -0.5f, 0.3f, 0.7f, -0.1f, 0.6f,
+        0.2f, 0.5f, -0.4f, 0.1f, 0.8f, -0.3f, 0.6f, -0.7f,
+        -0.2f, 0.3f, 0.4f, 0.6f, -0.8f, 0.2f, 0.1f, 0.5f,
+        0.7f, -0.5f, 0.2f, 0.4f, 0.3f, -0.1f, 0.8f, -0.4f
+    };
+    const uint8_t labels[4] = { 1, 0, 3, 2 };
+    TkmGraph *g = &g_shared_graph;
+    tkm_parse_dsl(g, dsl, batch);
+    tkm_optimize_and_bind(g);
+
+    int twin_fused = 0;
+    for (int i = 0; i < g->num_nodes; i++) {
+        if (!g->nodes[i].dead && g->nodes[i].op == OP_FC_TWIN_FUSED) twin_fused = 1;
+    }
+    if (!twin_fused) {
+        fprintf(stderr, "  [Fused-Graph-Check] Custom pointwise op blocked twin-FC fusion.\n");
+        return 1;
+    }
+
+    tkm_plan_memory(g);
+    char *cuda_src = tkm_codegen_cuda_string(g);
+    TkmRuntime *rt = tkm_runtime_ignite(g, cuda_src);
+    free(cuda_src);
+    if (!rt) return 1;
+
+    int errors = 0;
+    float loss = tkm_runtime_step(rt, input, labels, 0.0f);
+    const float eps = 5e-2f;
+    for (int i = 0; i < 8; i++) {
+        float plus[32], minus[32];
+        memcpy(plus, input, sizeof(input));
+        memcpy(minus, input, sizeof(input));
+        plus[i] += eps;
+        minus[i] -= eps;
+        float loss_plus = tkm_runtime_step(rt, plus, labels, 0.0f);
+        float loss_minus = tkm_runtime_step(rt, minus, labels, 0.0f);
+        tkm_runtime_step(rt, input, labels, 0.0f);
+        float analytical = tkm_get_grad_sample(rt, 0, i);
+        float numerical = (loss_plus - loss_minus) / (2.0f * eps);
+        if (!isfinite(analytical) || !isfinite(numerical) ||
+            fabsf(analytical - numerical) > 1e-2f) {
+            printf("  [Fused-Graph-Check] grad[%d] analytical %+0.5f numerical %+0.5f FAIL\n",
+                   i, analytical, numerical);
+            errors++;
+        }
+    }
+
+    if (errors == 0 && isfinite(loss)) {
+        printf("  [Fused-Graph-Check] Twin-FC + custom Softplus | Loss: %.5f | Input gradients: PASS\n", loss);
+    } else if (!isfinite(loss)) {
+        fprintf(stderr, "  [Fused-Graph-Check] Non-finite training loss.\n");
+        errors++;
+    }
+    tkm_runtime_free(rt);
+    return errors;
+}
+
 /* Fallback mathematical scalar evaluation for headless CI runners without physical GPUs */
 static float eval_scalar_fwd(TkmOpType op, float x, float w, float fval) {
     switch (op) {
@@ -129,18 +203,30 @@ static int run_numerical_calculus_check(void) {
     if (dev_cnt <= 0) {
         printf("  [Hardware Notice] No physical CUDA device detected. Running Host Calculus Audit...\n");
         const float test_pts[4] = { -1.6f, -0.4f, 0.5f, 1.4f };
-        for (int op_id = 0; op_id < OP_COUNT; op_id++) {
-            if (!is_numcheck_testable((TkmOpType)op_id)) continue;
-            const TkmOpSpec *spec = tkm_find_spec_by_op((TkmOpType)op_id);
-            if (!spec) continue;
+        for (int spec_id = 0; spec_id < tkm_get_spec_count(); spec_id++) {
+            const TkmOpSpec *spec = tkm_find_spec_by_index(spec_id);
+            if (!is_numcheck_testable_spec(spec)) continue;
 
             float fval = (spec->default_fval != 0.0f) ? spec->default_fval : 1.2f;
             float max_err = 0.0f;
             for (int p = 0; p < 4; p++) {
                 float x = test_pts[p], w = 0.8f, dy = 1.3f;
-                float ana_dx = eval_scalar_bwd((TkmOpType)op_id, x, w, fval, dy);
-                float num_dx = dy * (eval_scalar_fwd((TkmOpType)op_id, x + eps, w, fval) -
-                                     eval_scalar_fwd((TkmOpType)op_id, x - eps, w, fval)) / (2.0f * eps);
+                float ana_dx, num_dx;
+                if (spec->op == OP_USER_FLUID) {
+                    float deriv, y_plus, y_minus;
+                    if (!tkm_eval_math_expr(spec->bwd_expr, x, fval, &deriv) ||
+                        !tkm_eval_math_expr(spec->fwd_expr, x + eps, fval, &y_plus) ||
+                        !tkm_eval_math_expr(spec->fwd_expr, x - eps, fval, &y_minus)) {
+                        max_err = INFINITY;
+                        break;
+                    }
+                    ana_dx = dy * deriv;
+                    num_dx = dy * (y_plus - y_minus) / (2.0f * eps);
+                } else {
+                    ana_dx = eval_scalar_bwd(spec->op, x, w, fval, dy);
+                    num_dx = dy * (eval_scalar_fwd(spec->op, x + eps, w, fval) -
+                                   eval_scalar_fwd(spec->op, x - eps, w, fval)) / (2.0f * eps);
+                }
                 float err = fabsf(ana_dx - num_dx) / fmaxf(1.0f, fabsf(num_dx));
                 if (err > max_err) max_err = err;
             }
@@ -161,14 +247,18 @@ static int run_numerical_calculus_check(void) {
         if (fabsf(test_x[i]) < 0.1f) test_x[i] = 0.5f;
     }
 
-    for (int op_id = 0; op_id < OP_COUNT; op_id++) {
-        if (!is_numcheck_testable((TkmOpType)op_id)) continue;
-        const TkmOpSpec *spec = tkm_find_spec_by_op((TkmOpType)op_id);
-        if (!spec) continue;
+    for (int spec_id = 0; spec_id < tkm_get_spec_count(); spec_id++) {
+        const TkmOpSpec *spec = tkm_find_spec_by_index(spec_id);
+        if (!is_numcheck_testable_spec(spec)) continue;
 
         char mini_dsl[256];
-        snprintf(mini_dsl, sizeof(mini_dsl),
-                 "input: 1x1x32\ntest: %s -> SoftmaxCE", spec->dsl_name);
+        if (strcmp(spec->dsl_name, "Snake") == 0) {
+            snprintf(mini_dsl, sizeof(mini_dsl),
+                     "input: 1x1x32\ntest: Snake(1.7) -> SoftmaxCE");
+        } else {
+            snprintf(mini_dsl, sizeof(mini_dsl),
+                     "input: 1x1x32\ntest: %s -> SoftmaxCE", spec->dsl_name);
+        }
 
         TkmRuntime *rt = tkm_load_string(mini_dsl, B);
         if (!rt) {
@@ -200,6 +290,8 @@ static int run_numerical_calculus_check(void) {
         if (!pass) failed_ops++;
         tkm_runtime_free(rt);
     }
+
+    failed_ops += run_fused_user_fluid_check();
 
     printf("=========================================================================================\n");
     if (failed_ops == 0) {
@@ -433,7 +525,8 @@ int main(int argc, char **argv) {
             printf("[Registry Check] FAILED with %d validation errors.\n", errs);
             return 1;
         }
-        printf("[Registry Check] PASSED: All 42 operator specifications and fusion rules are valid.\n");
+        printf("[Registry Check] PASSED: All %d operator specifications and fusion rules are valid.\n",
+               tkm_get_spec_count());
         return 0;
     }
 

@@ -72,7 +72,7 @@ layer x 12: {
 
 ---
 
-## 3. Built-In Operator Reference (All 42 Operators)
+## 3. Built-In Operator Reference
 
 Plasma operators and `MixPool` use CUDA `half2` kernels and require an even channel count. Graphs that violate this constraint are rejected during optimization with a shape error.
 
@@ -99,9 +99,15 @@ Plasma operators and `MixPool` use CUDA `half2` kernels and require an even chan
 | | `BN` | `eps=1e-2` | Fast Channel-wise Group Normalization |
 | | `L2Norm` | `eps=1e-5` | Parameter-free unit hypersphere projection: $x / \|x\|_2$ |
 | | `QKNorm` | `eps=1e-5` | Sub-Warp per-head RMSNorm executed before RoPE |
+| **Probability & Loss** | `Softmax` | None | Stable row-wise softmax activation; differentiable and usable as an intermediate operator |
+| | `SoftmaxCE` | None | Softmax cross-entropy loss sink for integer class labels |
+| | `SoftmaxFocal` | `gamma=2.0` | Softmax focal loss for class-imbalanced classification |
+| | `SoftmaxMSE` | None | Brier score: mean squared error between softmax probabilities and one-hot class labels |
+| | `Softplus` | None | Smooth pointwise activation, registered as a math expression without CUDA snippets |
 | **Pointwise Fluid** | `SiLU` | None | Sigmoid Linear Unit: $x \cdot \sigma(x)$ |
 | | `ReLU` | None | Rectified Linear Unit: $\max(0, x)$ |
 | | `ReLU2` | None | Squared ReLU: $\max(0, x)^2$ (Primer / Nemotron) |
+| | `Snake` | `alpha=1.0` (must be positive) | Periodic activation: $x + \sin^2(\alpha x)/\alpha$; formula-only fused operator used in BigVGAN ([Lee et al., 2023](https://arxiv.org/abs/2206.04658)) |
 | | `LeakyReLU` | `alpha=0.01` | Leaky ReLU with custom slope on negative axis |
 | | `ELU` | `alpha=1.0` | Exponential Linear Unit: $\alpha(e^x - 1)$ for $x < 0$ |
 | | `GELU` | None | Fast Tanh Gaussian Error Linear Unit |
@@ -122,5 +128,12 @@ Plasma operators and `MixPool` use CUDA `half2` kernels and require an even chan
 | | `xATLU` | `init=0.5` | Learnable gated interpolation between Linear and SiLU |
 | | `Drop` | `p=0.1` | In-Register Dropout with bitmask storage |
 | | `RoPE` | None | Rotary Position Embedding |
-| | `SoftmaxCE` | None | Fused Softmax Cross-Entropy Loss Sink |
 ```
+
+`SoftmaxCE`, `SoftmaxFocal`, and `SoftmaxMSE` are terminal training-loss operators
+that consume logits and integer class labels. Each computes its own stable
+softmax; do not put a separate `Softmax` immediately before one of these sinks.
+`SoftmaxMSE` uses the one-hot Brier-score objective and averages over classes and
+batch rows. `SoftmaxFocal(gamma)` defaults to `gamma=2.0`.
+`Softmax` is now the standalone activation; models that used the former
+`Softmax` alias for cross-entropy should use `SoftmaxCE`.

@@ -81,7 +81,9 @@ typedef enum {
     OP_GELU, OP_MISH, OP_HARDSWISH, OP_HARDSIGMOID, OP_TANH, OP_SIGMOID,
     OP_SWISH_BETA, OP_SIN, OP_COSGATE, OP_SOFTCAP, OP_CLAMP,
     OP_SCALE, OP_LAYERSCALE, OP_DYT, OP_PRELU, OP_XATLU,
-    OP_ROPE, OP_DROP, OP_ADD, OP_MUL, OP_SOFTMAX_CE,
+    OP_ROPE, OP_DROP, OP_ADD, OP_MUL,
+    OP_SOFTMAX, OP_SOFTMAX_CE, OP_SOFTMAX_FOCAL, OP_SOFTMAX_MSE,
+    OP_USER_FLUID,
     OP_COUNT
 } TkmOpType;
 
@@ -93,6 +95,8 @@ typedef struct {
     float            default_fval;
     const char      *fwd_cuda;
     const char      *bwd_cuda;
+    const char      *fwd_expr;
+    const char      *bwd_expr;
 } TkmOpSpec;
 
 typedef enum {
@@ -118,6 +122,7 @@ typedef struct {
 
 typedef struct {
     int        id;
+    int        spec_id;
     char       tag[32];
     TkmOpType  op;
     TkmOpCat   cat;
@@ -180,6 +185,11 @@ typedef struct {
 
 const TkmOpSpec     *tkm_find_spec_by_op(TkmOpType op);
 const TkmOpSpec     *tkm_find_spec_by_name(const char *dsl_name);
+const TkmOpSpec     *tkm_find_spec_by_index(int index);
+const TkmOpSpec     *tkm_find_spec_by_node(const TkmNode *node);
+int                  tkm_get_spec_index(const TkmOpSpec *spec);
+int                  tkm_get_spec_count(void);
+int                  tkm_eval_math_expr(const char *expr, float x, float fval, float *out_value);
 const TkmFusionRule *tkm_get_fusion_rules(int *out_count);
 const char          *tkm_rng_name(TkmRngType r);
 const char          *tkm_rng_struct_name(TkmRngType r);

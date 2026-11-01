@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <ctype.h>
 
 #define TKM_ROWS_PER_CTA 16
 
@@ -37,6 +38,48 @@ static void sb_printf(StrBuf *sb, const char *fmt, ...) {
     vsnprintf(sb->buf + sb->len, (size_t)need + 1, fmt, ap);
     va_end(ap);
     sb->len += (size_t)need;
+}
+
+static const char *cuda_math_name(const char *name) {
+    if (!strcmp(name, "exp")) return "expf";
+    if (!strcmp(name, "log") || !strcmp(name, "ln")) return "logf";
+    if (!strcmp(name, "sqrt")) return "sqrtf";
+    if (!strcmp(name, "sin")) return "sinf";
+    if (!strcmp(name, "cos")) return "cosf";
+    if (!strcmp(name, "tanh")) return "tanhf";
+    if (!strcmp(name, "abs")) return "fabsf";
+    if (!strcmp(name, "max")) return "fmaxf";
+    if (!strcmp(name, "min")) return "fminf";
+    if (!strcmp(name, "pow")) return "powf";
+    return name;
+}
+
+static void emit_math_expr(StrBuf *sb, const char *expr, const char *x_name) {
+    const char *p = expr;
+    while (*p) {
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            char name[32];
+            int len = 0;
+            while ((isalnum((unsigned char)*p) || *p == '_') && len < (int)sizeof(name) - 1) {
+                name[len++] = *p++;
+            }
+            name[len] = '\0';
+            if (!strcmp(name, "x")) sb_printf(sb, "%s", x_name);
+            else if (!strcmp(name, "pi")) sb_printf(sb, "3.14159265358979323846f");
+            else sb_printf(sb, "%s", cuda_math_name(name));
+        } else {
+            sb_printf(sb, "%c", *p++);
+        }
+    }
+}
+
+static void emit_math_pair(StrBuf *sb, const char *expr, const char *dst,
+                           const char *x_name, const char *y_name, const char *assign) {
+    sb_printf(sb, "%s.x %s ", dst, assign);
+    emit_math_expr(sb, expr, x_name);
+    sb_printf(sb, ";\n%s.y %s ", dst, assign);
+    emit_math_expr(sb, expr, y_name);
+    sb_printf(sb, ";");
 }
 
 static void emit_sig(StrBuf *sb, const TkmKernelSig *sig) {
@@ -71,7 +114,7 @@ static void emit_coord_plasma_group(const TkmGraph *g, const PlasmaGroup *pg, St
     for (int i = 0; i < pg->count; i++) {
         const TkmNode *n = &g->nodes[pg->node_ids[i]];
         if (is_pixel_aug_op(n->op)) continue;
-        const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+        const TkmOpSpec *spec = tkm_find_spec_by_node(n);
         const char *rng_s = tkm_rng_struct_name(n->rng_type);
         sb_printf(sb, "        { // [Coord Brick #%d: %s]\n", n->id, spec->dsl_name);
         sb_printf(sb, "          const float fval = %.6ff, fval2 = %.6ff; (void)fval; (void)fval2;\n", n->fval, n->fval2);
@@ -84,7 +127,7 @@ static void emit_coord_plasma_group(const TkmGraph *g, const PlasmaGroup *pg, St
     for (int i = 0; i < pg->count; i++) {
         const TkmNode *n = &g->nodes[pg->node_ids[i]];
         if (!is_pixel_aug_op(n->op)) continue;
-        const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+        const TkmOpSpec *spec = tkm_find_spec_by_node(n);
         const char *rng_s = tkm_rng_struct_name(n->rng_type);
         sb_printf(sb, "            { // [Pixel Brick #%d: %s]\n", n->id, spec->dsl_name);
         sb_printf(sb, "              const float fval = %.6ff; (void)fval;\n", n->fval);
@@ -192,8 +235,8 @@ static void emit_qkv_prep_plasma_group(const TkmGraph *g, const PlasmaGroup *pg,
 }
 
 static void emit_node_fwd(StrBuf *sb, const TkmNode *n, const char *var_name) {
-    const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
-    if (!spec || !spec->fwd_cuda) return;
+    const TkmOpSpec *spec = tkm_find_spec_by_node(n);
+    if (!spec || (!spec->fwd_cuda && !spec->fwd_expr)) return;
     uint32_t f = spec->res_flags;
 
     sb_printf(sb, "            { // [Op #%d: %s]\n", n->id, spec->dsl_name);
@@ -236,6 +279,10 @@ static void emit_node_fwd(StrBuf *sb, const TkmNode *n, const char *var_name) {
                           "                  v = make_float2(fmaf(gm.x, xh.x, bt.x), fmaf(gm.y, xh.y, bt.y));\n"
                           "              }\n");
         }
+    } else if (spec->fwd_expr) {
+        sb_printf(sb, "              if (active) {\n                ");
+        emit_math_pair(sb, spec->fwd_expr, "v", "v.x", "v.y", "=");
+        sb_printf(sb, "\n              }\n");
     } else {
         sb_printf(sb, "              if (active) {\n                %s\n              }\n", spec->fwd_cuda);
     }
@@ -243,7 +290,7 @@ static void emit_node_fwd(StrBuf *sb, const TkmNode *n, const char *var_name) {
 }
 
 static void emit_node_bwd_acc_decl(StrBuf *sb, const TkmNode *n) {
-    const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+    const TkmOpSpec *spec = tkm_find_spec_by_node(n);
     if (!spec) return;
     uint32_t f = spec->res_flags;
     if (f & RES_PARAM_WEIGHT) sb_printf(sb, "        float2 acc_dw_%d = make_float2(0.f, 0.f);\n", n->id);
@@ -252,7 +299,7 @@ static void emit_node_bwd_acc_decl(StrBuf *sb, const TkmNode *n) {
 }
 
 static void emit_node_bwd_acc_flush(StrBuf *sb, const TkmNode *n, int subwarp_mode, int C2) {
-    const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+    const TkmOpSpec *spec = tkm_find_spec_by_node(n);
     if (!spec) return;
     uint32_t f = spec->res_flags;
     if (!(f & (RES_PARAM_WEIGHT | RES_PARAM_BETA | RES_PARAM_BIAS))) return;
@@ -296,8 +343,8 @@ static void emit_node_bwd_acc_flush(StrBuf *sb, const TkmNode *n, int subwarp_mo
 }
 
 static void emit_node_bwd_step(StrBuf *sb, const TkmNode *n, const char *grad_var, const char *pre_var) {
-    const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
-    if (!spec || !spec->bwd_cuda) return;
+    const TkmOpSpec *spec = tkm_find_spec_by_node(n);
+    if (!spec || (!spec->bwd_cuda && !spec->bwd_expr)) return;
     uint32_t f = spec->res_flags;
 
     sb_printf(sb, "            { // [Bwd Op #%d: %s]\n", n->id, spec->dsl_name);
@@ -340,6 +387,10 @@ static void emit_node_bwd_step(StrBuf *sb, const TkmNode *n, const char *grad_va
         sb_printf(sb, "              if (active) {\n"
                       "                  float2 p_br = __half22float2(dbranch_out[idx2]);\n"
                       "                  dbranch_out[idx2] = __floats2half2_rn(p_br.x + dy.x, p_br.y + dy.y);\n              }\n");
+    } else if (spec->bwd_expr) {
+        sb_printf(sb, "              if (active) {\n                ");
+        emit_math_pair(sb, spec->bwd_expr, "dy", "pre.x", "pre.y", "*=");
+        sb_printf(sb, "\n              }\n");
     } else {
         sb_printf(sb, "              if (active) {\n                %s\n              }\n", spec->bwd_cuda);
     }
@@ -351,7 +402,7 @@ static void emit_node_bwd_step(StrBuf *sb, const TkmNode *n, const char *grad_va
 }
 
 static void emit_replay_step(StrBuf *sb, const TkmNode *n, const char *vn) {
-    const TkmOpSpec *spec = tkm_find_spec_by_op(n->op);
+    const TkmOpSpec *spec = tkm_find_spec_by_node(n);
     if (!spec) return;
     if (spec->res_flags & RES_SAVE_XHAT) {
         sb_printf(sb, "            if (active) { float2 xh = __half22float2(__ldg(&save_xhat_%d[idx2]));\n", n->id);
