@@ -191,6 +191,18 @@ Inspect the graph and estimate its planned buffers with:
 tkm.exe inspect models/llama3_style.tkm --batch 1
 ```
 
+`run` selects training or inference automatically from the graph: a graph with a
+loss sink uses the training runtime, while a tensor-output graph uses the
+inference runtime. Override this explicitly when needed:
+
+```bash
+tkm.exe run models/llama3_style.tkm --batch 1 --steps 1 --inference
+tkm.exe run models/resnet_mnist.tkm --batch 64 --steps 100 --train
+```
+
+`--infer` is an alias for `--inference`. Explicit mode selection takes precedence
+over loss-sink detection.
+
 ### 3. End-to-End Training & Checkpointing Working Demo (`demo`)
 Trains a custom hybrid CNN+Twin-Branch network on synthetic pattern data, converges loss, evaluates test accuracy, and verifies weight save/load:
 ```bash

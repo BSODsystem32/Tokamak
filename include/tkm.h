@@ -220,6 +220,7 @@ typedef int (*TkmDatasetNext)(void *user, float *h_input, uint8_t *h_labels,
                               size_t capacity, size_t *out_count);
 
 TKM_API TkmRuntime *tkm_runtime_ignite(const TkmGraph *g, const char *cuda_src);
+TKM_API TkmRuntime *tkm_runtime_ignite_inference(const TkmGraph *g, const char *cuda_src);
 TKM_API TkmRuntime *tkm_load_file(const char *tkm_path, int batch_size);
 TKM_API TkmRuntime *tkm_load_string(const char *dsl_text, int batch_size);
 TKM_API TkmRuntime *tkm_load_buffer(const char *dsl_data, size_t dsl_size, int batch_size);
