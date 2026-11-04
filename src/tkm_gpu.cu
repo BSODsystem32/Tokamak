@@ -764,6 +764,7 @@ struct NodeGpuState {
 
 struct TkmRuntime {
     TkmGraph        graph;
+    int             training_enabled;
     cudaStream_t    stream;
     cublasHandle_t  cublas;
     CUmodule        nvrtc_mod;
@@ -827,6 +828,41 @@ static void alloc_and_register_param(SgdTensorList *sgd, float **d_m, __half **d
     sgd->offset[idx + 1] = sgd->offset[idx] + n;
 }
 
+static void alloc_inference_param(float **d_f, __half **d_h, int n,
+                                  float init_scale, float const_val) {
+    float *h = (float*)malloc((size_t)n * sizeof(float));
+    if (!h) {
+        fprintf(stderr, "[TKM Error] Host allocation failed for %d inference parameters.\n", n);
+        exit(1);
+    }
+    for (int i = 0; i < n; i++) {
+        if (init_scale > 0.0f) {
+            float u1 = (rand() + 1.0f) / ((float)RAND_MAX + 1.0f);
+            float u2 = (rand() + 1.0f) / ((float)RAND_MAX + 1.0f);
+            h[i] = sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2) * init_scale;
+        } else {
+            h[i] = const_val;
+        }
+    }
+    if (d_f) {
+        CUDA_CHECK(cudaMalloc(d_f, (size_t)n * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(*d_f, h, (size_t)n * sizeof(float), cudaMemcpyHostToDevice));
+    }
+    if (d_h) {
+        __half *h16 = (__half*)malloc((size_t)n * sizeof(__half));
+        if (!h16) {
+            free(h);
+            fprintf(stderr, "[TKM Error] Host allocation failed for %d half parameters.\n", n);
+            exit(1);
+        }
+        for (int i = 0; i < n; i++) h16[i] = __float2half(h[i]);
+        CUDA_CHECK(cudaMalloc(d_h, (size_t)n * sizeof(__half)));
+        CUDA_CHECK(cudaMemcpy(*d_h, h16, (size_t)n * sizeof(__half), cudaMemcpyHostToDevice));
+        free(h16);
+    }
+    free(h);
+}
+
 static void init_node_resources(TkmRuntime *rt, SgdTensorList *sgd, int nid) {
     const TkmNode *n = &rt->graph.nodes[nid];
     NodeGpuState *st = &rt->nstate[nid];
@@ -837,13 +873,23 @@ static void init_node_resources(TkmRuntime *rt, SgdTensorList *sgd, int nid) {
     if (n->op == OP_FC || n->op == OP_FC_TWIN_FUSED || n->op == OP_FC_QKV_FUSED) {
         int in_c = rt->graph.nodes[n->in0].C;
         st->in_dim = in_c; st->out_dim = C;
-        alloc_and_register_param(sgd, &st->d_W_master, &st->d_W_h, &st->d_vW, &st->d_dW,
-                                 in_c * C, sqrtf(2.0f / (float)in_c), 0.0f);
+        if (rt->training_enabled) {
+            alloc_and_register_param(sgd, &st->d_W_master, &st->d_W_h, &st->d_vW, &st->d_dW,
+                                     in_c * C, sqrtf(2.0f / (float)in_c), 0.0f);
+        } else {
+            alloc_inference_param(NULL, &st->d_W_h, in_c * C,
+                                  sqrtf(2.0f / (float)in_c), 0.0f);
+        }
     } else if (n->op == OP_CONV) {
         int in_c = rt->graph.nodes[n->in0].C;
         st->in_dim = 9 * in_c; st->out_dim = C;
-        alloc_and_register_param(sgd, &st->d_W_master, &st->d_W_h, &st->d_vW, &st->d_dW,
-                                 9 * in_c * C, sqrtf(2.0f / (float)(9 * in_c)), 0.0f);
+        if (rt->training_enabled) {
+            alloc_and_register_param(sgd, &st->d_W_master, &st->d_W_h, &st->d_vW, &st->d_dW,
+                                     9 * in_c * C, sqrtf(2.0f / (float)(9 * in_c)), 0.0f);
+        } else {
+            alloc_inference_param(NULL, &st->d_W_h, 9 * in_c * C,
+                                  sqrtf(2.0f / (float)(9 * in_c)), 0.0f);
+        }
     } else if (n->op == OP_MIXPOOL) {
         CUDA_CHECK(cudaMalloc(&st->d_save_mask, (size_t)rows * (C / 2) * sizeof(uint16_t)));
     } else if (n->op == OP_GQA_ATTN) {
@@ -853,12 +899,24 @@ static void init_node_resources(TkmRuntime *rt, SgdTensorList *sgd, int nid) {
     const TkmOpSpec *spec = tkm_find_spec_by_node(n);
     if (!spec) return;
     uint32_t f = spec->res_flags;
-    if (f & RES_PARAM_BIAS)
-        alloc_and_register_param(sgd, &st->d_bias, NULL, &st->d_vbias, &st->d_dbias, C, 0.0f, 0.0f);
-    if (f & RES_PARAM_WEIGHT)
-        alloc_and_register_param(sgd, &st->d_w_vec, NULL, &st->d_vw_vec, &st->d_dw_vec, C, 0.0f, 1.0f);
-    if (f & RES_PARAM_BETA)
-        alloc_and_register_param(sgd, &st->d_beta, NULL, &st->d_vbeta, &st->d_dbeta, C, 0.0f, 0.0f);
+    if (f & RES_PARAM_BIAS) {
+        if (rt->training_enabled)
+            alloc_and_register_param(sgd, &st->d_bias, NULL, &st->d_vbias, &st->d_dbias, C, 0.0f, 0.0f);
+        else
+            alloc_inference_param(&st->d_bias, NULL, C, 0.0f, 0.0f);
+    }
+    if (f & RES_PARAM_WEIGHT) {
+        if (rt->training_enabled)
+            alloc_and_register_param(sgd, &st->d_w_vec, NULL, &st->d_vw_vec, &st->d_dw_vec, C, 0.0f, 1.0f);
+        else
+            alloc_inference_param(&st->d_w_vec, NULL, C, 0.0f, 1.0f);
+    }
+    if (f & RES_PARAM_BETA) {
+        if (rt->training_enabled)
+            alloc_and_register_param(sgd, &st->d_beta, NULL, &st->d_vbeta, &st->d_dbeta, C, 0.0f, 0.0f);
+        else
+            alloc_inference_param(&st->d_beta, NULL, C, 0.0f, 0.0f);
+    }
     if (f & RES_SAVE_ISTD)
         CUDA_CHECK(cudaMalloc(&st->d_save_istd, (size_t)rows * sizeof(float)));
     if (f & RES_SAVE_XHAT)
@@ -867,10 +925,11 @@ static void init_node_resources(TkmRuntime *rt, SgdTensorList *sgd, int nid) {
         CUDA_CHECK(cudaMalloc(&st->d_save_mask, (size_t)rows * (C / 2) * sizeof(uint16_t)));
 }
 
-TkmRuntime *tkm_runtime_ignite(const TkmGraph *g, const char *cuda_src) {
+static TkmRuntime *tkm_runtime_ignite_mode(const TkmGraph *g, const char *cuda_src, int training_enabled) {
     cudaFree(0);
     TkmRuntime *rt = (TkmRuntime*)calloc(1, sizeof(TkmRuntime));
     rt->graph = *g;
+    rt->training_enabled = training_enabled;
     rt->last_lr = -1.0f;
 
     CUDA_CHECK(cudaStreamCreateWithFlags(&rt->stream, cudaStreamNonBlocking));
@@ -913,10 +972,12 @@ TkmRuntime *tkm_runtime_ignite(const TkmGraph *g, const char *cuda_src) {
         CU_CHECK(cuModuleGetFunction(&rt->bwd_funcs[i], rt->nvrtc_mod, g->groups[i].bwd_sig.func_name));
     }
 
-    CUDA_CHECK(cudaMalloc(&rt->d_arena,      g->total_arena_bytes));
-    CUDA_CHECK(cudaMalloc(&rt->d_grad_arena, g->total_arena_bytes));
+    CUDA_CHECK(cudaMalloc(&rt->d_arena, g->total_arena_bytes));
+    if (training_enabled)
+        CUDA_CHECK(cudaMalloc(&rt->d_grad_arena, g->total_arena_bytes));
     CUDA_CHECK(cudaMemset(rt->d_arena,      0, g->total_arena_bytes));
-    CUDA_CHECK(cudaMemset(rt->d_grad_arena, 0, g->total_arena_bytes));
+    if (training_enabled)
+        CUDA_CHECK(cudaMemset(rt->d_grad_arena, 0, g->total_arena_bytes));
 
     size_t in_elems = (size_t)g->batch_size * g->nodes[0].H * g->nodes[0].W * g->nodes[0].C;
     CUDA_CHECK(cudaMalloc(&rt->d_input_f32, in_elems * sizeof(float)));
@@ -959,6 +1020,14 @@ TkmRuntime *tkm_runtime_ignite(const TkmGraph *g, const char *cuda_src) {
     printf("  [TKM GPU Engine] Ignited %d NVRTC Kernels | %d Learnable Tensors (%d params) | %.2f MB Arena\n",
            g->num_groups * 2, rt->h_sgd.count, rt->total_sgd_elems, g->total_arena_bytes / (1024.0 * 1024.0));
     return rt;
+}
+
+TkmRuntime *tkm_runtime_ignite(const TkmGraph *g, const char *cuda_src) {
+    return tkm_runtime_ignite_mode(g, cuda_src, 1);
+}
+
+TkmRuntime *tkm_runtime_ignite_inference(const TkmGraph *g, const char *cuda_src) {
+    return tkm_runtime_ignite_mode(g, cuda_src, 0);
 }
 
 static void *resolve_arg_ptr(TkmRuntime *rt, const TkmKernelArg *a) {
@@ -1631,6 +1700,25 @@ void tkm_runtime_free(TkmRuntime *rt) {
     if (rt->d_labels)     cudaFree(rt->d_labels);
     if (rt->d_col_ws)     cudaFree(rt->d_col_ws);
     if (rt->d_cublas_ws)  cudaFree(rt->d_cublas_ws);
+    for (int i = 0; i < TKM_MAX_NODES; i++) {
+        NodeGpuState *st = &rt->nstate[i];
+        if (st->d_W_master) cudaFree(st->d_W_master);
+        if (st->d_W_h)      cudaFree(st->d_W_h);
+        if (st->d_vW)       cudaFree(st->d_vW);
+        if (st->d_dW)       cudaFree(st->d_dW);
+        if (st->d_bias)     cudaFree(st->d_bias);
+        if (st->d_vbias)    cudaFree(st->d_vbias);
+        if (st->d_dbias)    cudaFree(st->d_dbias);
+        if (st->d_w_vec)    cudaFree(st->d_w_vec);
+        if (st->d_vw_vec)   cudaFree(st->d_vw_vec);
+        if (st->d_dw_vec)   cudaFree(st->d_dw_vec);
+        if (st->d_beta)     cudaFree(st->d_beta);
+        if (st->d_vbeta)    cudaFree(st->d_vbeta);
+        if (st->d_dbeta)    cudaFree(st->d_dbeta);
+        if (st->d_save_istd) cudaFree(st->d_save_istd);
+        if (st->d_save_xhat) cudaFree(st->d_save_xhat);
+        if (st->d_save_mask) cudaFree(st->d_save_mask);
+    }
     cublasDestroy(rt->cublas);
     cudaStreamDestroy(rt->stream);
     free(rt);

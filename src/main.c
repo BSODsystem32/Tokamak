@@ -30,6 +30,18 @@ static double tkm_time_ms(void) {
 
 static TkmGraph g_shared_graph;
 
+static int graph_has_loss_sink(const TkmGraph *g) {
+    for (int i = 0; i < g->num_nodes; i++) {
+        if (!g->nodes[i].dead &&
+            (g->nodes[i].op == OP_SOFTMAX_CE ||
+             g->nodes[i].op == OP_SOFTMAX_FOCAL ||
+             g->nodes[i].op == OP_SOFTMAX_MSE)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static char *load_text_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); exit(1); }
@@ -515,7 +527,8 @@ static void print_usage(const char *prog) {
     printf("  %s bench\n", prog);
     printf("  %s demo\n", prog);
     printf("  %s inspect <model.tkm> [--batch N] [--emit out.cu]\n", prog);
-    printf("  %s run     <model.tkm> [--batch N] [--steps S] [--lr LR] [--save w.bin] [--load w.bin]\n\n", prog);
+    printf("  %s run     <model.tkm> [--batch N] [--steps S] [--lr LR] [--train|--inference] [--save w.bin] [--load w.bin]\n", prog);
+    printf("                 Default mode: auto (training when a loss sink exists, otherwise inference).\n\n");
 }
 
 int main(int argc, char **argv) {
@@ -556,12 +569,15 @@ int main(int argc, char **argv) {
     const char *load_bin = NULL;
     int         batch_sz = 64;
     int         steps    = 100;
+    int         requested_mode = -1; /* -1=auto, 0=train, 1=inference */
     float       lr       = 1e-3f;
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch_sz = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lr") && i + 1 < argc) lr = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--train")) requested_mode = 0;
+        else if (!strcmp(argv[i], "--inference") || !strcmp(argv[i], "--infer")) requested_mode = 1;
         else if (!strcmp(argv[i], "--emit") && i + 1 < argc) emit_cu = argv[++i];
         else if (!strcmp(argv[i], "--save") && i + 1 < argc) save_bin = argv[++i];
         else if (!strcmp(argv[i], "--load") && i + 1 < argc) load_bin = argv[++i];
@@ -586,19 +602,50 @@ int main(int argc, char **argv) {
     }
 
     if (!strcmp(mode, "run")) {
-        TkmRuntime *rt = tkm_runtime_ignite(&g_shared_graph, cuda_src);
-        if (load_bin) tkm_load_weights(rt, load_bin);
-
-        tkm_runtime_step(rt, NULL, NULL, lr);
-
-        printf("  [Execution] Running %d Fwd+Bwd+SGD steps via CUDA Graph...\n", steps);
-        double t0 = tkm_time_ms();
-
-        for (int s = 0; s < steps; s++) {
-            tkm_runtime_step(rt, NULL, NULL, lr);
+        int inference_only = requested_mode >= 0
+            ? requested_mode
+            : !graph_has_loss_sink(&g_shared_graph);
+        printf("  [Runtime Mode] %s%s\n",
+               inference_only ? "inference" : "training",
+               requested_mode < 0 ? " (auto)" : " (user-selected)");
+        TkmRuntime *rt = inference_only
+            ? tkm_runtime_ignite_inference(&g_shared_graph, cuda_src)
+            : tkm_runtime_ignite(&g_shared_graph, cuda_src);
+        if (load_bin && !inference_only) {
+            if (!tkm_load_weights(rt, load_bin))
+                fprintf(stderr, "  [Warning] Failed to load weights from '%s'\n", load_bin);
+        } else if (load_bin) {
+            fprintf(stderr, "  [Warning] --load is only supported for training runtimes; using initialized inference weights.\n");
         }
 
-        if (save_bin) tkm_save_weights(rt, save_bin);
+        double t0 = tkm_time_ms();
+        if (inference_only) {
+            size_t input_n = tkm_runtime_input_elements(rt);
+            size_t output_n = tkm_runtime_output_elements(rt);
+            float *input = (float*)calloc(input_n, sizeof(float));
+            float *output = (float*)malloc(output_n * sizeof(float));
+            if (!input || !output) {
+                fprintf(stderr, "  [Error] Host allocation failed for inference buffers.\n");
+                free(input);
+                free(output);
+                tkm_runtime_free(rt);
+                free(cuda_src);
+                return 1;
+            }
+            printf("  [Execution] Running %d inference forward passes (training state disabled)...\n", steps);
+            for (int s = 0; s < steps; s++)
+                tkm_runtime_forward(rt, input, output, output_n);
+            free(input);
+            free(output);
+        } else {
+            tkm_runtime_step(rt, NULL, NULL, lr);
+            printf("  [Execution] Running %d Fwd+Bwd+SGD steps via CUDA Graph...\n", steps);
+            for (int s = 0; s < steps; s++)
+                tkm_runtime_step(rt, NULL, NULL, lr);
+        }
+
+        if (save_bin && !inference_only && !tkm_save_weights(rt, save_bin))
+            fprintf(stderr, "  [Warning] Failed to save weights to '%s'\n", save_bin);
         tkm_runtime_free(rt);
 
         double ms = tkm_time_ms() - t0;
