@@ -143,6 +143,25 @@ For `models/llama3_style.tkm` with `B == 1`, the output is
 graph ending in `SoftmaxCE`, `SoftmaxFocal`, or `SoftmaxMSE` is a training/loss
 graph and has no inference output through this function.
 
+### Training and inference runtimes
+
+The normal `tkm_load_file`, `tkm_load_string`, and `tkm_load_buffer` helpers
+create a training-capable runtime. Applications that only need forward
+execution can use the lower-level runtime constructor after preparing a graph
+and generated CUDA source:
+
+```c
+TkmRuntime *rt = tkm_runtime_ignite_inference(&graph, cuda_source);
+```
+
+An inference runtime exposes the tensor-output path through
+`tkm_runtime_forward` and does not allocate the training/backward execution
+state. Use `tkm_runtime_ignite` when the application needs
+`tkm_runtime_step`, dataset training, or gradient diagnostics. The CLI's
+`run` command uses this same distinction: it auto-selects training for graphs
+with a loss sink and inference for tensor-output graphs, unless `--train`,
+`--inference`, or `--infer` explicitly selects the mode.
+
 ## 5. Error and return-value contract
 
 There is no thread-local error object or error-code query in the current ABI.
@@ -189,6 +208,19 @@ equivalent of `tkm_load_string`:
 The caller retains ownership of `g` and `cuda_src` and may release them after
 the call returns. Most host applications should use `tkm_load_file`,
 `tkm_load_string`, or `tkm_load_buffer`.
+
+#### `tkm_runtime_ignite_inference`
+
+```c
+TkmRuntime *tkm_runtime_ignite_inference(const TkmGraph *g,
+                                         const char *cuda_src);
+```
+
+Creates a runtime for forward-only inference from an already prepared graph and
+its generated CUDA source. It shares the same graph compilation and tensor
+layout as `tkm_runtime_ignite`, but omits training/backward execution state.
+Use `tkm_runtime_forward` to obtain the final tensor output. The caller retains
+ownership of `g` and `cuda_src` and may release them after the call returns.
 
 #### `tkm_load_file`
 
@@ -505,15 +537,15 @@ zero-initialize TkmGraph
 -> tkm_infer_shapes / tkm_optimize_and_bind
 -> tkm_plan_memory
 -> tkm_codegen_cuda_string
--> tkm_runtime_ignite
+-> tkm_runtime_ignite or tkm_runtime_ignite_inference
 ```
 
 `tkm_codegen_cuda_string` returns heap-allocated CUDA source; release it with
-the C runtime's `free`. `tkm_runtime_ignite` copies the graph and compiles the
-provided generated source, so the caller may release the source and graph
-after it returns. These lower-level APIs expose the internal graph capacity
-limits in `tkm.h` and are more sensitive to malformed or manually edited IR
-than the `tkm_load_*` helpers.
+the C runtime's `free`. Both runtime constructors copy the graph and compile
+the provided generated source, so the caller may release the source and graph
+after the call returns. These lower-level APIs expose the internal graph
+capacity limits in `tkm.h` and are more sensitive to malformed or manually
+edited IR than the `tkm_load_*` helpers.
 
 The registry inspection helpers (`tkm_find_spec_by_*`,
 `tkm_get_spec_*`, `tkm_eval_math_expr`, `tkm_get_fusion_rules`, and RNG name
