@@ -3,6 +3,7 @@
   <h1>⚡ Tokamak (tkm)</h1>
   <p><b>Bare-Metal Markup-to-CUDA Graph JIT Compiler & Deep Learning Engine</b></p>
   <p><i>Zero Python. Zero PyTorch. Zero LLVM. Pure C & NVRTC.</i></p>
+  <p><b>Current release: v3.0.0</b></p>
 </div>
 
 ---
@@ -12,6 +13,16 @@
 **Tokamak (`tkm`)** is an ultra-lightweight, high-performance deep learning JIT compiler designed for researchers and hackers who want to build custom neural network architectures like puzzle blocks—**without being forced into the heavy Python / PyTorch / Triton ecosystem.**
 
 You write your model architecture in a clean `.tkm` markup DSL. Tokamak parses the computational DAG, automatically infers all tensor shapes, applies a two-pass peephole fusion optimizer (horizontal GEMM merge + vertical register confinement), and compiles the entire forward, backward, and optimizer pipeline into **native CUDA C++ via in-memory NVRTC**—finally launching as a **single, zero-CPU-overhead `cudaGraphExec_t`**.
+
+### v3.0.0 highlights
+
+Tokamak 3.0.0 adds an explicit inference runtime alongside the existing training
+runtime. The `run` command now selects a mode automatically based on whether
+the graph contains a loss sink, while `--train`, `--inference`, and the `--infer`
+alias let callers override that choice. Inference runs use the tensor-output
+path without allocating training/backward state; embedding applications can use
+`tkm_runtime_ignite_inference` for the same lower-level behavior. See
+[docs/C_API.md](docs/C_API.md) for the runtime lifecycle and ABI details.
 
 ---
 
@@ -112,7 +123,7 @@ tkm/
 │   └── llama3_style.tkm  # LLaMA 3 8B-shaped decoder graph
 ├── build.bat             # Windows MSVC Build Script (CLI, DLL, and MNIST ABI example)
 ├── Makefile              # Linux GCC Build Script (Outputs tkm & libtkm.so)
-└── README.md
+└── README.MD
 ```
 
 ---
