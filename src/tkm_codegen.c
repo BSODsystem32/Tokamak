@@ -121,13 +121,14 @@ static void emit_sig(StrBuf *sb, const TkmKernelSig *sig) {
     sb_printf(sb, ") {\n");
 }
 
-static int is_pixel_aug_op(TkmOpType op) {
-    return (op == OP_RAND_NOISE || op == OP_RAND_CUTOUT ||
-            op == OP_RAND_BRIGHTNESS || op == OP_RAND_CONTRAST);
-}
-
 static void emit_coord_plasma_group(const TkmGraph *g, const PlasmaGroup *pg, StrBuf *sb) {
     int H = pg->H, W = pg->W, C = pg->C, HW = H * W, HWC = HW * C;
+    const char *sampler = pg->use_reflect_border ? "bilinear_sample_nhwc_reflect_h" : "bilinear_sample_nhwc_h";
+    int has_color = 0;
+    for (int i = 0; i < pg->count; i++) {
+        const TkmOpSpec *spec = tkm_find_spec_by_node(&g->nodes[pg->node_ids[i]]);
+        if (spec && (spec->res_flags & RES_AUG_COLOR)) has_color = 1;
+    }
 
     emit_sig(sb, &pg->fwd_sig);
     sb_printf(sb, "    int img_id = blockIdx.x;\n");
@@ -142,8 +143,8 @@ static void emit_coord_plasma_group(const TkmGraph *g, const PlasmaGroup *pg, St
 
     for (int i = 0; i < pg->count; i++) {
         const TkmNode *n = &g->nodes[pg->node_ids[i]];
-        if (is_pixel_aug_op(n->op)) continue;
         const TkmOpSpec *spec = tkm_find_spec_by_node(n);
+        if (!spec || (spec->res_flags & (RES_AUG_PIXEL | RES_AUG_COLOR)) || n->op == OP_BORDER_REFLECT) continue;
         const char *rng_s = tkm_rng_struct_name(n->rng_type);
         sb_printf(sb, "        { // [Coord Brick #%d: %s]\n", n->id, spec->dsl_name);
         sb_printf(sb, "          const float fval = %.6ff, fval2 = %.6ff; (void)fval; (void)fval2;\n", n->fval, n->fval2);
@@ -151,15 +152,43 @@ static void emit_coord_plasma_group(const TkmGraph *g, const PlasmaGroup *pg, St
         sb_printf(sb, "          %s\n        }\n", spec->fwd_cuda);
     }
 
-    sb_printf(sb, "        for (int ch = 0; ch < C; ch++) {\n");
-    sb_printf(sb, "            float val = bilinear_sample_nhwc_h(src_img, fx, fy, ch, H, W, C);\n");
+    if (has_color) {
+        sb_printf(sb, "        float pix[3];\n");
+        sb_printf(sb, "        for (int ch = 0; ch < 3; ch++) pix[ch] = %s(src_img, fx, fy, ch, H, W, C);\n", sampler);
+        for (int i = 0; i < pg->count; i++) {
+            const TkmNode *n = &g->nodes[pg->node_ids[i]];
+            const TkmOpSpec *spec = tkm_find_spec_by_node(n);
+            if (!spec || !(spec->res_flags & (RES_AUG_PIXEL | RES_AUG_COLOR))) continue;
+            const char *rng_s = tkm_rng_struct_name(n->rng_type);
+            if (spec->res_flags & RES_AUG_COLOR) {
+                sb_printf(sb, "        { // [Color Brick #%d: %s]\n", n->id, spec->dsl_name);
+                sb_printf(sb, "          float3 rgb = make_float3(pix[0], pix[1], pix[2]);\n");
+                sb_printf(sb, "          const float fval = %.6ff, fval2 = %.6ff; (void)fval2;\n", n->fval, n->fval2);
+                sb_printf(sb, "          %s img_rng; rng_init(&img_rng, base_seed ^ %du, (uint32_t)img_id);\n", rng_s, n->id * 19937 + 1);
+                sb_printf(sb, "          %s\n", spec->fwd_cuda);
+                sb_printf(sb, "          pix[0] = rgb.x; pix[1] = rgb.y; pix[2] = rgb.z;\n        }\n");
+            } else {
+                sb_printf(sb, "        for (int ch = 0; ch < 3; ch++) {\n");
+                sb_printf(sb, "          float val = pix[ch];\n");
+                sb_printf(sb, "          { // [Pixel Brick #%d: %s]\n", n->id, spec->dsl_name);
+                sb_printf(sb, "            const float fval = %.6ff, fval2 = %.6ff; (void)fval2;\n", n->fval, n->fval2);
+                sb_printf(sb, "            %s img_rng; rng_init(&img_rng, base_seed ^ %du, (uint32_t)img_id);\n", rng_s, n->id * 19937 + 1);
+                sb_printf(sb, "            %s pix_rng; rng_init(&pix_rng, base_seed ^ %du, (uint32_t)((img_id * %d + pix_id) * 3 + ch));\n", rng_s, n->id * 31337 + 7, HW);
+                sb_printf(sb, "            %s\n          }\n", spec->fwd_cuda);
+                sb_printf(sb, "          pix[ch] = val;\n        }\n");
+            }
+        }
+        sb_printf(sb, "        for (int ch = 0; ch < 3; ch++) dst_img[pix_id * 3 + ch] = __float2half(pix[ch]);\n");
+    } else {
+        sb_printf(sb, "        for (int ch = 0; ch < C; ch++) {\n");
+        sb_printf(sb, "            float val = %s(src_img, fx, fy, ch, H, W, C);\n", sampler);
     for (int i = 0; i < pg->count; i++) {
         const TkmNode *n = &g->nodes[pg->node_ids[i]];
-        if (!is_pixel_aug_op(n->op)) continue;
         const TkmOpSpec *spec = tkm_find_spec_by_node(n);
+        if (!spec || !(spec->res_flags & RES_AUG_PIXEL)) continue;
         const char *rng_s = tkm_rng_struct_name(n->rng_type);
         sb_printf(sb, "            { // [Pixel Brick #%d: %s]\n", n->id, spec->dsl_name);
-        sb_printf(sb, "              const float fval = %.6ff; (void)fval;\n", n->fval);
+        sb_printf(sb, "              const float fval = %.6ff, fval2 = %.6ff; (void)fval2;\n", n->fval, n->fval2);
         sb_printf(sb, "              %s img_rng; rng_init(&img_rng, base_seed ^ %du, (uint32_t)img_id);\n", rng_s, n->id * 19937 + 1);
         sb_printf(sb, "              %s pix_rng; rng_init(&pix_rng, base_seed ^ %du, (uint32_t)((img_id * %d + pix_id) * C + ch));\n",
                   rng_s, n->id * 31337 + 7, HW);
@@ -167,7 +196,9 @@ static void emit_coord_plasma_group(const TkmGraph *g, const PlasmaGroup *pg, St
         sb_printf(sb, "              %s\n            }\n", spec->fwd_cuda);
     }
     sb_printf(sb, "            dst_img[pix_id * C + ch] = __float2half(val);\n");
-    sb_printf(sb, "        }\n    }\n}\n\n");
+    sb_printf(sb, "        }\n");
+    }
+    sb_printf(sb, "    }\n}\n\n");
 
     emit_sig(sb, &pg->bwd_sig);
     sb_printf(sb, "    int img_id = blockIdx.x;\n");

@@ -115,7 +115,7 @@ void k_mixpool2x2_bwd_h2(const __half2 * __restrict__ dout, const uint16_t * __r
     int H_in = H_out * 2, W_in = W_out * 2, ix = ox * 2, iy = oy * 2;
 
     float2 g = __half22float2(__ldg(&dout[idx]));
-    uint16_t m = __ldg(&mask[idx]);
+    uint16_t m = mask ? __ldg(&mask[idx]) : 0;
     uint8_t mx = m & 0xFF, my = m >> 8;
 
     float aw = (1.0f - ratio) * 0.25f;
@@ -748,6 +748,24 @@ static const char *NVRTC_STANDALONE_PRELUDE =
 "    if (x0 >= 0 && x0 < W && y1 >= 0 && y1 < H) { float wt = (1.f-ax)*ay;       v += wt * __half2float(src[(y1*W+x0)*C+ch]); w += wt; }\n"
 "    if (x1 >= 0 && x1 < W && y1 >= 0 && y1 < H) { float wt = ax*ay;             v += wt * __half2float(src[(y1*W+x1)*C+ch]); w += wt; }\n"
 "    return w > 0.0f ? (v / w) : 0.0f;\n"
+"}\n"
+"__device__ __forceinline__ int tkm_reflect_idx(int i, int n) {\n"
+"    if (i < 0) i = -i;\n"
+"    if (i >= n) i = 2 * n - 2 - i;\n"
+"    return i < 0 ? 0 : (i >= n ? n - 1 : i);\n"
+"}\n"
+"__device__ __forceinline__ float bilinear_sample_nhwc_reflect_h(const __half *src, float fx, float fy, int ch, int H, int W, int C) {\n"
+"    int x0 = (int)floorf(fx), y0 = (int)floorf(fy);\n"
+"    float ax = fx - (float)x0, ay = fy - (float)y0;\n"
+"    int rx0 = tkm_reflect_idx(x0, W), rx1 = tkm_reflect_idx(x0 + 1, W);\n"
+"    int ry0 = tkm_reflect_idx(y0, H), ry1 = tkm_reflect_idx(y0 + 1, H);\n"
+"    float v00 = __half2float(src[(ry0 * W + rx0) * C + ch]);\n"
+"    float v10 = __half2float(src[(ry0 * W + rx1) * C + ch]);\n"
+"    float v01 = __half2float(src[(ry1 * W + rx0) * C + ch]);\n"
+"    float v11 = __half2float(src[(ry1 * W + rx1) * C + ch]);\n"
+"    float top = fmaf(ax, v10 - v00, v00);\n"
+"    float bot = fmaf(ax, v11 - v01, v01);\n"
+"    return fmaf(ay, bot - top, top);\n"
 "}\n\n";
 
 struct NodeGpuState {
@@ -1133,6 +1151,13 @@ static void execute_forward_pass(TkmRuntime *rt, int is_eval, int valid_examples
                     B, n->H, n->W, n->C / 2, n->fval);
                 break;
             }
+            case OP_AVGPOOL: {
+                int total = B * n->H * n->W * (n->C / 2);
+                k_mixpool2x2_fwd_h2<<<(total + 255) / 256, 256, 0, rt->stream>>>(
+                    (const __half2*)in_ptr, (__half2*)out_ptr, NULL,
+                    B, n->H, n->W, n->C / 2, 0.0f);
+                break;
+            }
             case OP_GQA_ATTN: {
                 int Seq = n->H * n->W;
                 dim3 grid(B * n->q_heads, (Seq + 31) / 32);
@@ -1255,6 +1280,13 @@ static void record_full_step_stream(TkmRuntime *rt) {
                 k_mixpool2x2_bwd_h2<<<(total + 255) / 256, 256, 0, rt->stream>>>(
                     (const __half2*)dout, rt->nstate[i].d_save_mask, (__half2*)din,
                     B, n->H, n->W, n->C / 2, n->fval);
+                break;
+            }
+            case OP_AVGPOOL: {
+                int total = B * n->H * n->W * (n->C / 2);
+                k_mixpool2x2_bwd_h2<<<(total + 255) / 256, 256, 0, rt->stream>>>(
+                    (const __half2*)dout, NULL, (__half2*)din,
+                    B, n->H, n->W, n->C / 2, 0.0f);
                 break;
             }
             case OP_GQA_ATTN: {

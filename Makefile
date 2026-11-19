@@ -27,7 +27,13 @@ mnist_idx: examples/mnist_idx.c include/tkm.h libtkm.so
 mnist_idx_static: examples/mnist_idx.c include/tkm.h libtkm.a
 	$(NVCC) $(CFLAGS) $(ARCH) examples/mnist_idx.c libtkm.a $(LDFLAGS) -o mnist_idx_static
 
-clean:
-	rm -f tkm mnist_idx mnist_idx_static *.so *.a *.cu.out *.ptx
+cifar10_bin: examples/cifar10_bin.c include/tkm.h libtkm.so
+	$(CC) -O2 -Iinclude examples/cifar10_bin.c -L. -ltkm -lm -Wl,-rpath,'$$ORIGIN' -o cifar10_bin
 
-.PHONY: all clean mnist_idx mnist_idx_static
+cifar10_bin_static: examples/cifar10_bin.c include/tkm.h libtkm.a
+	$(NVCC) $(CFLAGS) $(ARCH) examples/cifar10_bin.c libtkm.a $(LDFLAGS) -o cifar10_bin_static
+
+clean:
+	rm -f tkm mnist_idx mnist_idx_static cifar10_bin cifar10_bin_static *.so *.a *.cu.out *.ptx
+
+.PHONY: all clean mnist_idx mnist_idx_static cifar10_bin cifar10_bin_static

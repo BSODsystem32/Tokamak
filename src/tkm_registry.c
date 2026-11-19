@@ -56,6 +56,7 @@ static const TkmOpSpec TKM_OP_REGISTRY[] = {
     { OP_FLATTEN,       "Flatten",    CAT_SPATIAL, RES_NONE, 0.0f,  NULL, NULL },
 
     /* --- Resolution-Independent 2D Coordinate & Pixel Bricks (CAT_COORD, 0 Shared Memory!) --- */
+    { OP_BORDER_REFLECT, "BorderReflect", CAT_COORD, RES_NONE, 0.0f, NULL, NULL },
     {
         OP_RAND_SHIFT, "RandShift", CAT_COORD, RES_RNG_SEED, 2.0f,
         "int span = 2 * (int)fval + 1;\n"
@@ -105,7 +106,7 @@ static const TkmOpSpec TKM_OP_REGISTRY[] = {
         NULL
     },
     {
-        OP_RAND_NOISE, "RandNoise", CAT_COORD, RES_RNG_SEED, 0.03f,
+        OP_RAND_NOISE, "RandNoise", CAT_COORD, RES_RNG_SEED | RES_AUG_PIXEL, 0.03f,
         "if (rng_u32(&img_rng) & 1u) {\n"
         "    float2 n2 = rng_normal2(&pix_rng);\n"
         "    val = fminf(fmaxf(fmaf(n2.x, fval, val), 0.0f), 1.0f);\n"
@@ -113,22 +114,71 @@ static const TkmOpSpec TKM_OP_REGISTRY[] = {
         NULL
     },
     {
-        OP_RAND_CUTOUT, "RandCutout", CAT_COORD, RES_RNG_SEED, 4.0f,
+        OP_RAND_CUTOUT, "RandCutout", CAT_COORD, RES_RNG_SEED | RES_AUG_PIXEL, 4.0f,
         "int box_r = (int)(fval * 0.5f);\n"
         "int cut_x = (int)(rng_u32(&img_rng) % W), cut_y = (int)(rng_u32(&img_rng) % H);\n"
         "if (abs(px - cut_x) <= box_r && abs(py - cut_y) <= box_r) val = 0.0f;",
         NULL
     },
     {
-        OP_RAND_BRIGHTNESS, "RandBrightness", CAT_COORD, RES_RNG_SEED, 0.15f,
+        OP_RAND_BRIGHTNESS, "RandBrightness", CAT_COORD, RES_RNG_SEED | RES_AUG_PIXEL, 0.15f,
         "float db = (rng_uniform(&img_rng) * 2.0f - 1.0f) * fval;\n"
         "val = fminf(fmaxf(val + db, 0.0f), 1.0f);",
         NULL
     },
     {
-        OP_RAND_CONTRAST, "RandContrast", CAT_COORD, RES_RNG_SEED, 0.20f,
+        OP_RAND_CONTRAST, "RandContrast", CAT_COORD, RES_RNG_SEED | RES_AUG_PIXEL, 0.20f,
         "float cf = 1.0f + (rng_uniform(&img_rng) * 2.0f - 1.0f) * fval;\n"
         "val = fminf(fmaxf((val - 0.5f) * cf + 0.5f, 0.0f), 1.0f);",
+        NULL
+    },
+    {
+        OP_RAND_SATURATION, "RandSaturation", CAT_COORD, RES_RNG_SEED | RES_AUG_COLOR, 0.30f,
+        "float sf = 1.0f + (rng_uniform(&img_rng) * 2.0f - 1.0f) * fval;\n"
+        "float luma = 0.299f * rgb.x + 0.587f * rgb.y + 0.114f * rgb.z;\n"
+        "rgb.x = fminf(fmaxf(luma + (rgb.x - luma) * sf, 0.0f), 1.0f);\n"
+        "rgb.y = fminf(fmaxf(luma + (rgb.y - luma) * sf, 0.0f), 1.0f);\n"
+        "rgb.z = fminf(fmaxf(luma + (rgb.z - luma) * sf, 0.0f), 1.0f);",
+        NULL
+    },
+    {
+        OP_RAND_HUE, "RandHue", CAT_COORD, RES_RNG_SEED | RES_AUG_COLOR, 0.08f,
+        "float ang = (rng_uniform(&img_rng) * 2.0f - 1.0f) * (fval * 6.2831853f);\n"
+        "float s, c; __sincosf(ang, &s, &c);\n"
+        "float m = (rgb.x + rgb.y + rgb.z) * 0.33333334f * (1.0f - c);\n"
+        "float k = s * 0.57735027f;\n"
+        "float nr = rgb.x * c + (rgb.z - rgb.y) * k + m;\n"
+        "float ng = rgb.y * c + (rgb.x - rgb.z) * k + m;\n"
+        "float nb = rgb.z * c + (rgb.y - rgb.x) * k + m;\n"
+        "rgb = make_float3(fminf(fmaxf(nr, 0.0f), 1.0f), fminf(fmaxf(ng, 0.0f), 1.0f), fminf(fmaxf(nb, 0.0f), 1.0f));",
+        NULL
+    },
+    {
+        OP_RAND_GRAYSCALE, "RandGrayscale", CAT_COORD, RES_RNG_SEED | RES_AUG_COLOR, 0.10f,
+        "if (rng_uniform(&img_rng) < fval) {\n"
+        "    float luma = 0.299f * rgb.x + 0.587f * rgb.y + 0.114f * rgb.z;\n"
+        "    rgb = make_float3(luma, luma, luma);\n"
+        "}",
+        NULL
+    },
+    {
+        OP_RAND_CHANNEL_SCALE, "RandChannelScale", CAT_COORD, RES_RNG_SEED | RES_AUG_COLOR, 0.15f,
+        "float sr = 1.0f + (rng_uniform(&img_rng) * 2.0f - 1.0f) * fval;\n"
+        "float sg = 1.0f + (rng_uniform(&img_rng) * 2.0f - 1.0f) * fval;\n"
+        "float sb = 1.0f + (rng_uniform(&img_rng) * 2.0f - 1.0f) * fval;\n"
+        "rgb = make_float3(fminf(fmaxf(rgb.x * sr, 0.0f), 1.0f), fminf(fmaxf(rgb.y * sg, 0.0f), 1.0f), fminf(fmaxf(rgb.z * sb, 0.0f), 1.0f));",
+        NULL
+    },
+    {
+        OP_RAND_SOLARIZE, "RandSolarize", CAT_COORD, RES_RNG_SEED | RES_AUG_PIXEL, 0.50f,
+        "if ((rng_u32(&img_rng) & 1u) && val > fval) val = 1.0f - val;",
+        NULL
+    },
+    {
+        OP_RAND_ERASING, "RandErasing", CAT_COORD, RES_RNG_SEED | RES_AUG_PIXEL, 8.0f,
+        "int erase_r = (int)(fval * 0.5f);\n"
+        "int erase_x = (int)(rng_u32(&img_rng) % W), erase_y = (int)(rng_u32(&img_rng) % H);\n"
+        "if ((rng_u32(&img_rng) & 1u) && abs(px - erase_x) <= erase_r && abs(py - erase_y) <= erase_r) val = rng_uniform(&pix_rng);",
         NULL
     },
 
