@@ -197,51 +197,28 @@ __global__ __launch_bounds__(256, 4)
 void k_conv_direct_small_cin_fwd_h(const __half * __restrict__ in, const __half * __restrict__ W,
                                    __half * __restrict__ out, int N, int H, int W_dim,
                                    int in_c, int out_c) {
-    int tiles_x = (W_dim + 15) / 16;
-    int tiles_y = (H + 15) / 16;
-    int tile = blockIdx.x;
-    int n = tile / (tiles_y * tiles_x);
-    if (n >= N) return;
-    int rem = tile % (tiles_y * tiles_x);
-    int by = rem / tiles_x, bx = rem % tiles_x;
-    int tid = threadIdx.x;
-    int c_local = tid & 31, sub = tid >> 5;
-    int co_base = (int)blockIdx.y * 32;
-    __shared__ float s_in[18][18][4];
-    __shared__ float s_w[9][4][32];
-    for (int i = tid; i < 18 * 18 * in_c; i += blockDim.x) {
-        int ci = i % in_c, q = i / in_c;
-        int sy = q / 18, sx = q % 18;
-        int gy = by * 16 + sy - 1, gx = bx * 16 + sx - 1;
-        s_in[sy][sx][ci] = (gy >= 0 && gy < H && gx >= 0 && gx < W_dim)
-            ? __half2float(__ldg(&in[((size_t)n * H * W_dim + gy * W_dim + gx) * in_c + ci]))
-            : 0.0f;
-    }
-    for (int i = tid; i < 9 * in_c * 32; i += blockDim.x) {
-        int co = i % 32, q = i / 32;
-        int ci = q % in_c, k = q / in_c;
-        s_w[k][ci][co] = (co_base + co < out_c)
-            ? __half2float(__ldg(&W[conv_weight_index(k, ci, co_base + co, in_c, out_c)]))
-            : 0.0f;
-    }
-    __syncthreads();
-    int co = co_base + c_local;
-    if (co >= out_c) return;
-    for (int p = sub; p < 256; p += 8) {
-        int ly = p / 16, lx = p % 16;
-        int oy = by * 16 + ly, ox = bx * 16 + lx;
-        if (oy >= H || ox >= W_dim) continue;
-        float sum = 0.0f;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * H * W_dim * out_c;
+    if (idx >= total) return;
+    int co = idx % out_c, rem = idx / out_c;
+    int x = rem % W_dim, t = rem / W_dim, y = t % H, n = t / H;
+    if (in_c != 1) return;
+    float sum = 0.0f;
+    #pragma unroll
+    for (int ky = -1; ky <= 1; ky++) {
+        int iy = y + ky;
+        if (iy < 0 || iy >= H) continue;
         #pragma unroll
-        for (int ky = 0; ky < 3; ky++)
-            #pragma unroll
-            for (int kx = 0; kx < 3; kx++) {
-                int k = ky * 3 + kx;
-                for (int ci = 0; ci < in_c; ci++)
-                    sum = fmaf(s_in[ly + ky + 1][lx + kx + 1][ci], s_w[k][ci][c_local], sum);
-            }
-        out[((size_t)n * H * W_dim + oy * W_dim + ox) * out_c + co] = __float2half(sum);
+        for (int kx = -1; kx <= 1; kx++) {
+            int ix = x + kx;
+            if (ix < 0 || ix >= W_dim) continue;
+            int k = (ky + 1) * 3 + (kx + 1);
+            float xv = __half2float(__ldg(&in[((size_t)n * H * W_dim + iy * W_dim + ix)]));
+            float w = __half2float(__ldg(&W[conv_weight_index(k, 0, co, 1, out_c)]));
+            sum = fmaf(xv, w, sum);
+        }
     }
+    out[((size_t)n * H * W_dim + y * W_dim + x) * out_c + co] = __float2half(sum);
 }
 
 __global__ __launch_bounds__(256, 4)
@@ -522,10 +499,8 @@ static int conv_uses_wmma(int in_c, int out_c, int k, int s, int p) {
 
 static int conv_select_mode(const TkmNode *n, const TkmNode *in0) {
     if (n->k == 1 && n->s == 1 && n->p == 0) return CONV_MODE_1X1;
-    if (n->k == 3 && n->s == 1 && n->p == 1 && in0->C >= 1 && in0->C <= 4)
+    if (n->k == 3 && n->s == 1 && n->p == 1 && in0->C == 1)
         return CONV_MODE_DIRECT_3X3;
-    if (conv_uses_wmma(in0->C, n->C, n->k, n->s, n->p))
-        return CONV_MODE_WMMA_3X3;
     return CONV_MODE_IM2COL;
 }
 
@@ -1570,7 +1545,7 @@ static TkmRuntime *tkm_runtime_ignite_mode(const TkmGraph *g, const char *cuda_s
             TkmNode *in0 = &rt->graph.nodes[n->in0];
             int mode = conv_select_mode(n, in0);
             rt->nstate[i].conv_mode = mode;
-            if (mode == CONV_MODE_1X1 || mode == CONV_MODE_DIRECT_3X3) continue;
+            if (mode == CONV_MODE_1X1) continue;
             size_t csz = (size_t)g->batch_size * n->H * n->W * n->k * n->k * in0->C;
             if (csz > max_col) max_col = csz;
         }
@@ -1608,7 +1583,8 @@ static TkmRuntime *tkm_runtime_ignite_mode(const TkmGraph *g, const char *cuda_s
     int has_im2col = 0;
     for (int i = 0; i < g->num_nodes; i++) {
         if (!g->nodes[i].dead && g->nodes[i].op == OP_CONV &&
-            rt->nstate[i].conv_mode == CONV_MODE_IM2COL) {
+            (rt->nstate[i].conv_mode == CONV_MODE_IM2COL ||
+             rt->nstate[i].conv_mode == CONV_MODE_DIRECT_3X3)) {
             has_im2col = 1;
             break;
         }
@@ -1725,9 +1701,8 @@ static void execute_forward_pass(TkmRuntime *rt, int is_eval, int valid_examples
                         rt->d_zero, out_ptr, CUDA_R_16F, n->C,
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                 } else if (conv_mode == CONV_MODE_DIRECT_3X3) {
-                    int tiles = B * ((in0->H + 15) / 16) * ((in0->W + 15) / 16);
-                    dim3 grid(tiles, (n->C + 31) / 32);
-                    k_conv_direct_small_cin_fwd_h<<<grid, 256, 0, rt->stream>>>(
+                    int total = B * in0->H * in0->W * n->C;
+                    k_conv_direct_small_cin_fwd_h<<<(total + 255) / 256, 256, 0, rt->stream>>>(
                         (const __half*)in_ptr, rt->nstate[i].d_W_h, (__half*)out_ptr,
                         B, in0->H, in0->W, in0->C, n->C);
                 } else if (conv_mode == CONV_MODE_WMMA_3X3) {
@@ -1884,18 +1859,26 @@ static void record_full_step_stream(TkmRuntime *rt, int clear_loss) {
                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                     }
                 } else if (conv_mode == CONV_MODE_DIRECT_3X3) {
-                    CUDA_CHECK(cudaMemsetAsync(rt->nstate[i].d_dW, 0,
-                                               (size_t)9 * in0->C * n->C * sizeof(float), rt->stream));
-                    int tiles = B * ((in0->H + 15) / 16) * ((in0->W + 15) / 16);
-                    dim3 dw_grid(tiles, (n->C + 31) / 32);
-                    k_conv_direct_small_cin_dW_h<<<dw_grid, 256, 0, rt->stream>>>(
-                        (const __half*)in_act, (const __half*)dout, rt->nstate[i].d_dW,
-                        B, in0->H, in0->W, in0->C, n->C);
+                    int elems = B * n->H * n->W * in0->C;
+                    k_im2col_nhwc_h<<<(elems + 255) / 256, 256, 0, rt->stream>>>(
+                        (const __half*)in_act, rt->d_col_ws, B, in0->H, in0->W,
+                        n->H, n->W, in0->C, n->k, n->s, n->p);
+                    int K = rt->nstate[i].in_dim, N_out = rt->nstate[i].out_dim;
+                    CUBLAS_CHECK(cublasGemmEx(rt->cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                        N_out, K, rows, rt->d_one,
+                        dout, CUDA_R_16F, N_out, rt->d_col_ws, CUDA_R_16F, K,
+                        rt->d_zero, rt->nstate[i].d_dW, CUDA_R_32F, N_out,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                     if (needs_input_grad) {
-                        int elems = B * in0->H * in0->W * in0->C;
-                        k_conv_direct_small_cin_dX_h<<<(elems + 255) / 256, 256, 0, rt->stream>>>(
-                            (const __half*)dout, rt->nstate[i].d_W_h, (__half*)din,
-                            B, in0->H, in0->W, in0->C, n->C);
+                        CUBLAS_CHECK(cublasGemmEx(rt->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            K, rows, N_out, rt->d_one,
+                            rt->nstate[i].d_W_h, CUDA_R_16F, N_out, dout, CUDA_R_16F, N_out,
+                            rt->d_zero, rt->d_col_ws, CUDA_R_16F, K,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                        int din_elems = B * in0->H * in0->W * in0->C;
+                        k_col2im_nhwc_h<<<(din_elems + 255) / 256, 256, 0, rt->stream>>>(
+                            rt->d_col_ws, (__half*)din, B, in0->H, in0->W,
+                            n->H, n->W, in0->C, n->k, n->s, n->p);
                     }
                 } else if (conv_mode == CONV_MODE_WMMA_3X3) {
                     CUDA_CHECK(cudaMemsetAsync(rt->nstate[i].d_dW, 0,
