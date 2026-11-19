@@ -52,7 +52,9 @@ typedef enum {
     RES_SAVE_XHAT    = (1 << 4),
     RES_SAVE_MASK    = (1 << 5),
     RES_RNG_SEED     = (1 << 6),
-    RES_BRANCH_IN    = (1 << 7)
+    RES_BRANCH_IN    = (1 << 7),
+    RES_AUG_PIXEL    = (1 << 8),
+    RES_AUG_COLOR    = (1 << 9)
 } TkmResourceFlags;
 
 typedef enum {
@@ -72,8 +74,11 @@ typedef enum {
     /* Spatial */
     OP_MIXPOOL, OP_AVGPOOL, OP_FLATTEN,
     /* Fusable 2D Coordinate & Pixel Augmentation Bricks */
+    OP_BORDER_REFLECT,
     OP_RAND_SHIFT, OP_RAND_ROTATE, OP_RAND_SCALE, OP_RAND_FLIPX, OP_RAND_FLIPY,
     OP_RAND_ELASTIC, OP_RAND_NOISE, OP_RAND_CUTOUT, OP_RAND_BRIGHTNESS, OP_RAND_CONTRAST,
+    OP_RAND_SATURATION, OP_RAND_HUE, OP_RAND_GRAYSCALE, OP_RAND_CHANNEL_SCALE,
+    OP_RAND_SOLARIZE, OP_RAND_ERASING,
     /* Norms */
     OP_BN, OP_LN, OP_RMSNORM, OP_L2NORM, OP_QKNORM,
     /* Fluid Activations & Modulations */
@@ -162,6 +167,7 @@ typedef struct {
     int          is_twin_epilogue;
     int          is_coord_group;
     int          is_qkv_prep;
+    int          use_reflect_border;
     int          out_node_id;
     int          H, W, C;
     TkmKernelSig fwd_sig;

@@ -86,6 +86,7 @@ Plasma operators and `MixPool` use CUDA `half2` kernels and require an even chan
 | | `Flatten` | None | Flattens $[H, W, C]$ to $[1, 1, H \cdot W \cdot C]$ |
 | **2D Augmentation** | `RandShift` | `fval=2` (max shift pixels) | Random spatial translation $(dx, dy)$ |
 | *(Fused, 0 SMEM)* | `RandRotate` | `fval=10.0` (max angle deg) | Random rotation around image center $(cx, cy)$ |
+| | `BorderReflect` | None | Reflective bilinear sampling for natural-image borders |
 | | `RandScale` | `fval=0.10` (delta scale) | Random zoom-in/out scaling |
 | | `RandFlipX` | `fval=0.5` (probability) | Random horizontal reflection |
 | | `RandFlipY` | `fval=0.5` (probability) | Random vertical reflection |
@@ -94,6 +95,12 @@ Plasma operators and `MixPool` use CUDA `half2` kernels and require an even chan
 | | `RandCutout` | `fval=4.0` (box size) | Random zero-masking rectangular patch |
 | | `RandBrightness` | `fval=0.15` (delta) | Random additive brightness shift |
 | | `RandContrast` | `fval=0.20` (delta) | Random multiplicative contrast adjustment |
+| | `RandSaturation` | `fval=0.30` (delta) | RGB saturation jitter; requires `C=3` |
+| | `RandHue` | `fval=0.08` (turns) | RGB hue rotation; requires `C=3` |
+| | `RandGrayscale` | `fval=0.10` (probability) | Random RGB-to-luma conversion; requires `C=3` |
+| | `RandChannelScale` | `fval=0.15` (delta) | Independent RGB channel gain jitter; requires `C=3` |
+| | `RandSolarize` | `fval=0.50` (threshold) | Random image solarization |
+| | `RandErasing` | `fval=8.0` (box size) | Random rectangular erasing filled with uniform noise |
 | **Normalization** | `RMSNorm` | `eps=1e-5` | In-Register RMSNorm: $\frac{x}{\text{RMS}(x)} \cdot \gamma$ |
 | | `LN` | `eps=1e-5` | In-Register LayerNorm: $\frac{x - \mu}{\sigma} \cdot \gamma + \beta$ |
 | | `BN` | `eps=1e-2` | Fast Channel-wise Group Normalization |

@@ -1,0 +1,25 @@
+input: 32x32x3
+prng : philox
+
+flow:
+  aug: BorderReflect -> RandFlipX(0.5) -> RandShift(4) -> RandBrightness(0.15) -> RandContrast(0.15) -> RandSaturation(0.25) -> RandHue(0.05) -> RandGrayscale(0.05) -> RandErasing(8)
+
+  stage1: Conv(c=32, k=3, s=1, p=1) -> BN -> SiLU -> MixPool(2, ratio=0.85)
+  res1: {
+    branch: Conv(c=32, k=3, s=1, p=1) -> BN -> SiLU
+    skip  : Identity
+  } -> Add
+
+  stage2: Conv(c=64, k=3, s=1, p=1) -> BN -> Mish -> MixPool(2, ratio=0.85)
+  res2: {
+    branch: Conv(c=64, k=3, s=1, p=1) -> BN -> SiLU
+    skip  : Identity
+  } -> Add
+
+  stage3: Conv(c=128, k=3, s=1, p=1) -> BN -> SiLU -> MixPool(2, ratio=0.85)
+  res3: {
+    branch: Conv(c=128, k=3, s=1, p=1) -> BN -> SiLU
+    skip  : Identity
+  } -> Add
+
+  head: AvgPool(2) -> AvgPool(2) -> Flatten -> FC(256) -> LN -> SiLU -> FC(10) -> SoftmaxCE

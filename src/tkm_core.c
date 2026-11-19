@@ -414,6 +414,19 @@ void tkm_optimize_and_bind(TkmGraph *g) {
                     i, n->tag, n->C);
             exit(1);
         }
+        if (!n->dead && n->op == OP_AVGPOOL && n->C % 2 != 0) {
+            fprintf(stderr, "[TKM Shape Error] AvgPool node #%d (%s) has odd channel count %d; CUDA half2 kernels require an even channel count.\n",
+                    i, n->tag, n->C);
+            exit(1);
+        }
+        if (!n->dead) {
+            const TkmOpSpec *spec = tkm_find_spec_by_node(n);
+            if (spec && (spec->res_flags & RES_AUG_COLOR) && n->C != 3) {
+                fprintf(stderr, "[TKM Shape Error] Color augmentation node #%d (%s) requires exactly 3 channels, got %d.\n",
+                        i, n->tag, n->C);
+                exit(1);
+            }
+        }
     }
 
     for (int i = 0; i < g->num_nodes; i++) {
@@ -453,10 +466,11 @@ void tkm_optimize_and_bind(TkmGraph *g) {
             while (cur >= 0 && cur < g->num_nodes) {
                 TkmNode *cn = &g->nodes[cur];
                 if (cn->dead || cn->plasma_grp >= 0 || cn->cat != CAT_COORD) break;
-                int is_pix = (cn->op == OP_RAND_NOISE || cn->op == OP_RAND_CUTOUT ||
-                              cn->op == OP_RAND_BRIGHTNESS || cn->op == OP_RAND_CONTRAST);
+                const TkmOpSpec *spec = tkm_find_spec_by_node(cn);
+                int is_pix = spec && (spec->res_flags & (RES_AUG_PIXEL | RES_AUG_COLOR));
                 if (seen_pixel_op && !is_pix) break;
                 if (is_pix) seen_pixel_op = 1;
+                if (cn->op == OP_BORDER_REFLECT) pg->use_reflect_border = 1;
 
                 pg->node_ids[pg->count++] = cur;
                 pg->out_node_id = cur;

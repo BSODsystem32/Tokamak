@@ -87,13 +87,22 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [Tokamak] 4/4 Building C ABI examples...
+echo [Tokamak] 4/4 Building C ABI examples (DLL and static)...
 cl.exe /nologo /O2 /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS /DTKM_USE_DLL /Iinclude ^
     examples\mnist_idx.c tkm.lib ^
     /Fe:mnist_idx.exe
 
 if %ERRORLEVEL% neq 0 (
     echo [Error] mnist_idx.exe build failed!
+    exit /b 1
+)
+
+cl.exe /nologo /O2 /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS /DTKM_USE_DLL /Iinclude ^
+    examples\cifar10_bin.c tkm.lib ^
+    /Fe:cifar10_bin.exe
+
+if %ERRORLEVEL% neq 0 (
+    echo [Error] cifar10_bin.exe build failed!
     exit /b 1
 )
 
@@ -111,5 +120,19 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
+cl.exe /nologo /O2 /W3 /utf-8 /D_CRT_SECURE_NO_WARNINGS /Iinclude ^
+    examples\cifar10_bin.c tkm_static.lib ^
+    "%CUDA_PATH%\lib\x64\cudart.lib" ^
+    "%CUDA_PATH%\lib\x64\nvrtc.lib" ^
+    "%CUDA_PATH%\lib\x64\cuda.lib" ^
+    "%CUDA_PATH%\lib\x64\cublas.lib" ^
+    "%CUDA_PATH%\lib\x64\cublasLt.lib" ^
+    /Fe:cifar10_bin_static.exe
+
+if %ERRORLEVEL% neq 0 (
+    echo [Error] Static CIFAR-10 C ABI link check failed!
+    exit /b 1
+)
+
 echo.
-echo [Success] Built tkm.exe, tkm.dll (+ import library), tkm_static.lib, and both C ABI examples!
+echo [Success] Built tkm.exe, tkm.dll (+ import library), tkm_static.lib, and all C ABI examples!
