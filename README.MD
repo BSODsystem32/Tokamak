@@ -3,7 +3,7 @@
   <h1>⚡ Tokamak (tkm)</h1>
   <p><b>Bare-Metal Markup-to-CUDA Graph JIT Compiler & Deep Learning Engine</b></p>
   <p><i>Zero Python. Zero PyTorch. Zero LLVM. Pure C & NVRTC.</i></p>
-  <p><b>Current release: v4.1.0</b></p>
+  <p><b>Current release: v4.2.0</b></p>
 </div>
 
 ---
@@ -22,6 +22,15 @@ batch preparation, forward, backward, SGD, and loss accumulation on the GPU
 graph path, with one loss readback per epoch. Sub-warp Plasma backward groups
 also use grid-stride replay with a capped backward grid to reduce L2 atomic
 contention.
+
+### v4.2.0 highlights
+
+Tokamak 4.2.0 adds zero-im2col execution for standard 3x3 convolutions.
+Direct shared-memory kernels handle `C_in <= 4`, including RGB inputs, while
+16-channel-aligned convolutions use WMMA Tensor Core implicit GEMM for forward,
+`dX`, and `dW`. Aligned CNN graphs no longer allocate `d_col_ws`; unaligned
+convolutions retain the im2col + cuBLAS fallback. `tkm numcheck` now includes
+finite-difference checks for both direct and WMMA convolution gradients.
 
 ### v4.0.1 highlights
 
