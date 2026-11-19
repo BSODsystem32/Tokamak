@@ -3,7 +3,7 @@
   <h1>⚡ Tokamak (tkm)</h1>
   <p><b>Bare-Metal Markup-to-CUDA Graph JIT Compiler & Deep Learning Engine</b></p>
   <p><i>Zero Python. Zero PyTorch. Zero LLVM. Pure C & NVRTC.</i></p>
-  <p><b>Current release: v4.0.0</b></p>
+  <p><b>Current release: v4.0.1</b></p>
 </div>
 
 ---
@@ -13,6 +13,14 @@
 **Tokamak (`tkm`)** is an ultra-lightweight, high-performance deep learning JIT compiler designed for researchers and hackers who want to build custom neural network architectures like puzzle blocks—**without being forced into the heavy Python / PyTorch / Triton ecosystem.**
 
 You write your model architecture in a clean `.tkm` markup DSL. Tokamak parses the computational DAG, automatically infers all tensor shapes, applies a two-pass peephole fusion optimizer (horizontal GEMM merge + vertical register confinement), and compiles the entire forward, backward, and optimizer pipeline into **native CUDA C++ via in-memory NVRTC**—finally launching as a **single, zero-CPU-overhead `cudaGraphExec_t`**.
+
+### v4.0.1 highlights
+
+Tokamak 4.0.1 improves the CIFAR-10 example with unbiased PCG32
+Fisher-Yates epoch shuffling and tuned Nesterov SGD learning-rate warmup and
+cosine decay. It also preserves full `32x32` stage-1 resolution in
+`resnet_cifar10.tkm`, cleans NVRTC unused-variable codegen warnings, and
+documents `AvgPool` as a `half2`-kernel operator requiring even channels.
 
 ### v4.0.0 highlights
 
@@ -265,7 +273,7 @@ mnist_idx train-images-idx3-ubyte train-labels-idx1-ubyte t10k-images-idx3-ubyte
 
 With batch size 1024 and 30 epochs, one run reported train loss `0.1206` and test accuracy `9846/10000 (98.46%)`; this is an observed result, not a guarantee. Training uses complete fixed-size batches, so the example reports and skips any leftover training samples. See [docs/C_API.md](docs/C_API.md) for the full ABI walkthrough and command example.
 
-`tkm_runtime_eval` accepts any positive sample count and excludes padded rows in a final partial batch. Plasma operators and `MixPool` use CUDA `half2` kernels and therefore require even channel counts.
+`tkm_runtime_eval` accepts any positive sample count and excludes padded rows in a final partial batch. Plasma operators, `MixPool`, and `AvgPool` use CUDA `half2` kernels and therefore require even channel counts.
 
 ---
 

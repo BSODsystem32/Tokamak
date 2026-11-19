@@ -74,7 +74,7 @@ layer x 12: {
 
 ## 3. Built-In Operator Reference
 
-Plasma operators and `MixPool` use CUDA `half2` kernels and require an even channel count. Graphs that violate this constraint are rejected during optimization with a shape error.
+Plasma operators, MixPool, and AvgPool use CUDA half2 kernels and require an even channel count. Graphs that violate this constraint are rejected during optimization with a shape error.
 
 | Category | Operator | Arguments & Defaults | Description |
 | :--- | :--- | :--- | :--- |
