@@ -67,43 +67,55 @@ struct TkmSchedule {
     uint32_t warmup_steps;
 };
 
-__global__ void k_resident_gather_and_lr(const __half * __restrict__ images,
-                                         const uint8_t * __restrict__ labels,
-                                         const uint32_t * __restrict__ order,
-                                         __half * __restrict__ batch_images,
-                                         uint8_t * __restrict__ batch_labels,
-                                         float * __restrict__ d_lr,
-                                         uint32_t * __restrict__ batch_idx,
-                                         uint32_t * __restrict__ global_step,
-                                         const TkmSchedule * __restrict__ sched,
-                                         int sample_elems, int batch_size) {
+__global__ void k_resident_gather(const __half * __restrict__ images,
+                                  const uint8_t * __restrict__ labels,
+                                  const uint32_t * __restrict__ order,
+                                  __half * __restrict__ batch_images,
+                                  uint8_t * __restrict__ batch_labels,
+                                  const uint32_t * __restrict__ batch_idx,
+                                  int sample_elems, int batch_size) {
+    int sample = blockIdx.x;
+    if (sample >= batch_size) return;
     uint32_t b = *batch_idx;
+    uint32_t source = order[(size_t)b * (size_t)batch_size + (size_t)sample];
+    if (threadIdx.x == 0)
+        batch_labels[sample] = labels[source];
+
+    const __half *src = images + (size_t)source * sample_elems;
+    __half *dst = batch_images + (size_t)sample * sample_elems;
+    if (sample_elems % 8 == 0) {
+        const uint4 *src4 = (const uint4*)src;
+        uint4 *dst4 = (uint4*)dst;
+        int vec_elems = sample_elems / 8;
+        for (int i = threadIdx.x; i < vec_elems; i += 256)
+            dst4[i] = src4[i];
+    } else if (sample_elems % 2 == 0) {
+        const half2 *src2 = (const half2*)src;
+        half2 *dst2 = (half2*)dst;
+        int vec_elems = sample_elems / 2;
+        for (int i = threadIdx.x; i < vec_elems; i += 256)
+            dst2[i] = src2[i];
+    } else {
+        for (int i = threadIdx.x; i < sample_elems; i += 256)
+            dst[i] = src[i];
+    }
+}
+
+__global__ void k_resident_advance_lr(float * __restrict__ d_lr,
+                                      uint32_t * __restrict__ batch_idx,
+                                      uint32_t * __restrict__ global_step,
+                                      const TkmSchedule * __restrict__ sched) {
+    if (threadIdx.x != 0) return;
     uint32_t step = *global_step;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = sample_elems * batch_size;
-    for (int i = tid; i < total; i += gridDim.x * blockDim.x) {
-        int sample = i / sample_elems;
-        int elem = i % sample_elems;
-        uint32_t source = order[(size_t)b * (size_t)batch_size + (size_t)sample];
-        batch_images[(size_t)sample * sample_elems + elem] =
-            images[(size_t)source * sample_elems + elem];
-    }
-    if (tid < batch_size) {
-        uint32_t source = order[(size_t)b * (size_t)batch_size + (size_t)tid];
-        batch_labels[tid] = labels[source];
-    }
-    if (tid == 0) {
-        float warmup = (sched->warmup_steps > 0 && step < sched->warmup_steps)
-            ? (float)(step + 1u) / (float)sched->warmup_steps : 1.0f;
-        float progress = sched->total_steps > 1
-            ? fminf((float)step / (float)(sched->total_steps - 1u), 1.0f) : 1.0f;
-        float cosine = 0.5f * (1.0f + cosf(3.14159265358979323846f * progress));
-        float lr = sched->peak_lr * warmup *
-                   (sched->min_lr_ratio + (1.0f - sched->min_lr_ratio) * cosine);
-        *d_lr = lr;
-        *batch_idx = b + 1u;
-        *global_step = step + 1u;
-    }
+    float warmup = (sched->warmup_steps > 0 && step < sched->warmup_steps)
+        ? (float)(step + 1u) / (float)sched->warmup_steps : 1.0f;
+    float progress = sched->total_steps > 1
+        ? fminf((float)step / (float)(sched->total_steps - 1u), 1.0f) : 1.0f;
+    float cosine = 0.5f * (1.0f + cosf(3.14159265358979323846f * progress));
+    *d_lr = sched->peak_lr * warmup *
+        (sched->min_lr_ratio + (1.0f - sched->min_lr_ratio) * cosine);
+    *batch_idx = *batch_idx + 1u;
+    *global_step = step + 1u;
 }
 
 __global__ void k_perturb_f16(__half * __restrict__ ptr, int idx, float delta) {
@@ -1831,11 +1843,12 @@ TkmDataset *tkm_dataset_create(TkmRuntime *rt, const float *h_images,
 
         CUDA_CHECK(cudaStreamSynchronize(rt->stream));
         CUDA_CHECK(cudaStreamBeginCapture(rt->stream, cudaStreamCaptureModeGlobal));
-        k_resident_gather_and_lr<<<256, 256, 0, rt->stream>>>(
+        k_resident_gather<<<rt->graph.batch_size, 256, 0, rt->stream>>>(
             ds->d_images_h, ds->d_labels_u8, ds->d_order,
             (__half*)(rt->d_arena + rt->graph.nodes[0].out_offset), rt->d_labels,
-            rt->d_lr, ds->d_batch_idx, ds->d_global_step, ds->d_sched,
-            (int)ds->sample_elems, rt->graph.batch_size);
+            ds->d_batch_idx, (int)ds->sample_elems, rt->graph.batch_size);
+        k_resident_advance_lr<<<1, 1, 0, rt->stream>>>(
+            rt->d_lr, ds->d_batch_idx, ds->d_global_step, ds->d_sched);
         record_full_step_stream(rt, 0);
         CUDA_CHECK(cudaStreamEndCapture(rt->stream, &ds->resident_graph));
         CUDA_CHECK(cudaGraphInstantiate(&ds->resident_exec, ds->resident_graph, NULL, NULL, 0));

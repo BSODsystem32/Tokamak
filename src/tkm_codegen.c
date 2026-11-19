@@ -531,6 +531,7 @@ static void emit_plasma_group(const TkmGraph *g, const PlasmaGroup *pg, StrBuf *
 
     if (subwarp_mode) {
         sb_printf(sb, "    int tid = threadIdx.x %% %d;\n", C2);
+        sb_printf(sb, "    {\n");
     } else {
         sb_printf(sb, "    int base_row = blockIdx.x * %d;\n", TKM_ROWS_PER_CTA);
         sb_printf(sb, "    for (int tid = threadIdx.x; tid < %d; tid += 256) {\n", aligned_c2);
@@ -548,7 +549,6 @@ static void emit_plasma_group(const TkmGraph *g, const PlasmaGroup *pg, StrBuf *
         sb_printf(sb, "    for (int blk = blockIdx.x; blk < %d; blk += gridDim.x) {\n", (rows + rows_per_blk - 1) / rows_per_blk);
         sb_printf(sb, "        int row = blk * %d + (threadIdx.x / %d);\n", rows_per_blk, C2);
         sb_printf(sb, "        int active = (row < %d);\n", rows);
-        sb_printf(sb, "        {\n");
     } else {
         sb_printf(sb, "        for (int r = 0; r < %d; r++) {\n", TKM_ROWS_PER_CTA);
         sb_printf(sb, "            int row = base_row + r;\n");
