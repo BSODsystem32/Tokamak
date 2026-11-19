@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 enum {
@@ -38,10 +39,6 @@ static int load_cifar_file(const char *path, CifarData *data, size_t offset, siz
         if (!read_exact(file, record, sizeof(record)) || record[0] > 9) {
             fprintf(stderr, "Invalid or truncated CIFAR-10 record in %s at image %zu.\n", path, image);
             fclose(file);
-            free(data->images);
-            free(data->labels);
-            data->images = NULL;
-            data->labels = NULL;
             return 0;
         }
         data->labels[offset + image] = record[0];
@@ -107,15 +104,54 @@ static int parse_positive_int(const char *text, int *value) {
     return 1;
 }
 
+typedef struct {
+    uint64_t state;
+    uint64_t inc;
+} Pcg32;
+
+static uint32_t pcg32_next(Pcg32 *rng) {
+    uint64_t oldstate = rng->state;
+    rng->state = oldstate * 6364136223846793005ULL + rng->inc;
+    uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
+    uint32_t rot = (uint32_t)(oldstate >> 59u);
+    return (xorshifted >> rot) | (xorshifted << ((32u - rot) & 31u));
+}
+
+static void pcg32_init(Pcg32 *rng, uint64_t initstate, uint64_t initseq) {
+    rng->state = 0ULL;
+    rng->inc = (initseq << 1u) | 1ULL;
+    pcg32_next(rng);
+    rng->state += initstate;
+    pcg32_next(rng);
+}
+
+static uint32_t pcg32_bounded(Pcg32 *rng, uint32_t bound) {
+    uint32_t threshold = (~bound + 1u) % bound;
+    for (;;) {
+        uint32_t r = pcg32_next(rng);
+        if (r >= threshold) return r % bound;
+    }
+}
+
+static int parse_positive_float(const char *text, float *value) {
+    char *end = NULL;
+    float parsed = strtof(text, &end);
+    if (!text[0] || !end || *end || !isfinite(parsed) || parsed <= 0.0f) return 0;
+    *value = parsed;
+    return 1;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 4) {
-        fprintf(stderr, "Usage: %s <cifar-10-binary-dir> [batch=64] [epochs=1]\n", argv[0]);
+    if (argc < 2 || argc > 5) {
+        fprintf(stderr, "Usage: %s <cifar-10-binary-dir> [batch=64] [epochs=1] [lr=0.02]\n", argv[0]);
         return 2;
     }
     int batch_size = 64, epochs = 1;
+    float peak_lr = 0.02f;
     if ((argc >= 3 && !parse_positive_int(argv[2], &batch_size)) ||
-        (argc >= 4 && !parse_positive_int(argv[3], &epochs))) {
-        fprintf(stderr, "Batch size and epochs must be positive integers.\n");
+        (argc >= 4 && !parse_positive_int(argv[3], &epochs)) ||
+        (argc >= 5 && !parse_positive_float(argv[4], &peak_lr))) {
+        fprintf(stderr, "Batch size and epochs must be positive integers; learning rate must be finite and positive.\n");
         return 2;
     }
 
@@ -142,18 +178,52 @@ int main(int argc, char **argv) {
         return 1;
     }
     size_t total_steps = full_batches * (size_t)epochs;
+    size_t warmup_steps = total_steps / 10;
+    if (warmup_steps > 500) warmup_steps = 500;
+
+    size_t *order = (size_t*)malloc(train.count * sizeof(*order));
+    float *batch_images = (float*)malloc((size_t)batch_size * CIFAR_IMAGE_BYTES * sizeof(*batch_images));
+    uint8_t *batch_labels = (uint8_t*)malloc((size_t)batch_size * sizeof(*batch_labels));
+    if (!order || !batch_images || !batch_labels) {
+        fprintf(stderr, "Unable to allocate CIFAR-10 shuffle buffers.\n");
+        free(order);
+        free(batch_images);
+        free(batch_labels);
+        tkm_runtime_free(runtime);
+        free_cifar_data(&train);
+        free_cifar_data(&test);
+        return 1;
+    }
+    for (size_t i = 0; i < train.count; i++) order[i] = i;
+
+    Pcg32 rng;
+    pcg32_init(&rng, 0x4d595df4d0f33173ULL, 0x9e3779b97f4a7c15ULL);
+
     size_t step = 0;
     for (int epoch = 0; epoch < epochs; epoch++) {
+        for (size_t i = train.count; i > 1; i--) {
+            uint32_t j = pcg32_bounded(&rng, (uint32_t)i);
+            size_t tmp = order[i - 1];
+            order[i - 1] = order[j];
+            order[j] = tmp;
+        }
         float loss_sum = 0.0f;
         for (size_t b = 0; b < full_batches; b++, step++) {
-            float progress = total_steps > 1 ? (float)step / (float)(total_steps - 1) : 1.0f;
-            float warmup = step < 500 ? (float)(step + 1) / 500.0f : 1.0f;
-            float cosine = 0.5f * (1.0f + cosf(3.14159265359f * progress));
-            float lr = 1e-3f * warmup * (0.1f + 0.9f * cosine);
             size_t start = b * (size_t)batch_size;
-            loss_sum += tkm_runtime_step(runtime,
-                                          train.images + start * CIFAR_IMAGE_BYTES,
-                                          train.labels + start, lr);
+            for (size_t row = 0; row < (size_t)batch_size; row++) {
+                size_t source = order[start + row];
+                memcpy(batch_images + row * CIFAR_IMAGE_BYTES,
+                       train.images + source * CIFAR_IMAGE_BYTES,
+                       CIFAR_IMAGE_BYTES * sizeof(*batch_images));
+                batch_labels[row] = train.labels[source];
+            }
+            float progress = total_steps > 1 ? (float)step / (float)(total_steps - 1) : 1.0f;
+            float warmup = (warmup_steps > 0 && step < warmup_steps)
+                ? (float)(step + 1) / (float)warmup_steps
+                : 1.0f;
+            float cosine = 0.5f * (1.0f + cosf(3.14159265359f * progress));
+            float lr = peak_lr * warmup * (0.05f + 0.95f * cosine);
+            loss_sum += tkm_runtime_step(runtime, batch_images, batch_labels, lr);
         }
         printf("epoch %d/%d: train loss %.4f\n", epoch + 1, epochs, loss_sum / (float)full_batches);
     }
@@ -161,6 +231,9 @@ int main(int argc, char **argv) {
     int correct = tkm_runtime_eval(runtime, test.images, test.labels, (int)test.count);
     printf("test accuracy: %d/%zu (%.2f%%)\n", correct, test.count,
            100.0 * (double)correct / (double)test.count);
+    free(order);
+    free(batch_images);
+    free(batch_labels);
     tkm_runtime_free(runtime);
     free_cifar_data(&train);
     free_cifar_data(&test);
