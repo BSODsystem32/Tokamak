@@ -60,6 +60,52 @@ __global__ void k_f32_to_f16(const float * __restrict__ src, __half * __restrict
     if (i < n) dst[i] = __float2half(src[i]);
 }
 
+struct TkmSchedule {
+    float peak_lr;
+    float min_lr_ratio;
+    uint32_t total_steps;
+    uint32_t warmup_steps;
+};
+
+__global__ void k_resident_gather_and_lr(const __half * __restrict__ images,
+                                         const uint8_t * __restrict__ labels,
+                                         const uint32_t * __restrict__ order,
+                                         __half * __restrict__ batch_images,
+                                         uint8_t * __restrict__ batch_labels,
+                                         float * __restrict__ d_lr,
+                                         uint32_t * __restrict__ batch_idx,
+                                         uint32_t * __restrict__ global_step,
+                                         const TkmSchedule * __restrict__ sched,
+                                         int sample_elems, int batch_size) {
+    uint32_t b = *batch_idx;
+    uint32_t step = *global_step;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = sample_elems * batch_size;
+    for (int i = tid; i < total; i += gridDim.x * blockDim.x) {
+        int sample = i / sample_elems;
+        int elem = i % sample_elems;
+        uint32_t source = order[(size_t)b * (size_t)batch_size + (size_t)sample];
+        batch_images[(size_t)sample * sample_elems + elem] =
+            images[(size_t)source * sample_elems + elem];
+    }
+    if (tid < batch_size) {
+        uint32_t source = order[(size_t)b * (size_t)batch_size + (size_t)tid];
+        batch_labels[tid] = labels[source];
+    }
+    if (tid == 0) {
+        float warmup = (sched->warmup_steps > 0 && step < sched->warmup_steps)
+            ? (float)(step + 1u) / (float)sched->warmup_steps : 1.0f;
+        float progress = sched->total_steps > 1
+            ? fminf((float)step / (float)(sched->total_steps - 1u), 1.0f) : 1.0f;
+        float cosine = 0.5f * (1.0f + cosf(3.14159265358979323846f * progress));
+        float lr = sched->peak_lr * warmup *
+                   (sched->min_lr_ratio + (1.0f - sched->min_lr_ratio) * cosine);
+        *d_lr = lr;
+        *batch_idx = b + 1u;
+        *global_step = step + 1u;
+    }
+}
+
 __global__ void k_perturb_f16(__half * __restrict__ ptr, int idx, float delta) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         float v = __half2float(ptr[idx]);
@@ -780,6 +826,33 @@ struct NodeGpuState {
     uint16_t *d_save_mask;
 };
 
+struct TkmDataset {
+    TkmRuntime *rt;
+    const float *h_images;
+    const uint8_t *h_labels;
+    size_t num_samples;
+    size_t sample_elems;
+    int resident;
+
+    __half *d_images_h;
+    uint8_t *d_labels_u8;
+    uint32_t *d_order;
+    uint32_t *d_batch_idx;
+    uint32_t *d_global_step;
+    TkmSchedule *d_sched;
+    uint32_t *h_pin_order;
+
+    float *h_pin_in[2];
+    uint8_t *h_pin_lbl[2];
+    float *h_pin_lr[2];
+    cudaEvent_t slot_done[2];
+    cudaGraph_t stream_graph[2];
+    cudaGraphExec_t stream_exec[2];
+    cudaGraph_t resident_graph;
+    cudaGraphExec_t resident_exec;
+    int graphs_captured;
+};
+
 struct TkmRuntime {
     TkmGraph        graph;
     int             training_enabled;
@@ -800,6 +873,8 @@ struct TkmRuntime {
     float          *d_loss_buf;
     int            *d_corr_buf;
     uint32_t       *d_seed;
+    float          *h_pin_loss;
+    float          *h_pin_lr;
     int             total_sgd_elems;
     SgdTensorList   h_sgd;
 
@@ -1020,6 +1095,10 @@ static TkmRuntime *tkm_runtime_ignite_mode(const TkmGraph *g, const char *cuda_s
     CUDA_CHECK(cudaMalloc(&rt->d_loss_buf, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&rt->d_corr_buf, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&rt->d_seed,     sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocHost(&rt->h_pin_loss, sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&rt->h_pin_lr, sizeof(float)));
+    *rt->h_pin_loss = 0.0f;
+    *rt->h_pin_lr = init_lr;
     CUDA_CHECK(cudaMemcpy(rt->d_seed, &init_seed, sizeof(uint32_t), cudaMemcpyHostToDevice));
 
     memset(&rt->h_sgd, 0, sizeof(SgdTensorList));
@@ -1197,11 +1276,12 @@ static void execute_forward_pass(TkmRuntime *rt, int is_eval, int valid_examples
     }
 }
 
-static void record_full_step_stream(TkmRuntime *rt) {
+static void record_full_step_stream(TkmRuntime *rt, int clear_loss) {
     const TkmGraph *g = &rt->graph;
     int B = g->batch_size;
 
-    CUDA_CHECK(cudaMemsetAsync(rt->d_loss_buf, 0, sizeof(float), rt->stream));
+    if (clear_loss)
+        CUDA_CHECK(cudaMemsetAsync(rt->d_loss_buf, 0, sizeof(float), rt->stream));
     CUDA_CHECK(cudaMemsetAsync(rt->d_grad_arena, 0, g->total_arena_bytes, rt->stream));
     for (int i = 0; i < rt->h_sgd.count; i++) {
         if (rt->h_sgd.fp16_w[i] == NULL) {
@@ -1221,7 +1301,9 @@ static void record_full_step_stream(TkmRuntime *rt) {
             int gid = n->plasma_grp;
             if (!executed_grp[gid]) {
                 executed_grp[gid] = 1;
-                launch_plasma_sig(rt, rt->bwd_funcs[gid], &g->groups[gid].bwd_sig);
+                const PlasmaGroup *pg = &g->groups[gid];
+                if (!(pg->is_coord_group && pg->anchor_id == 0))
+                    launch_plasma_sig(rt, rt->bwd_funcs[gid], &pg->bwd_sig);
             }
             continue;
         }
@@ -1265,13 +1347,16 @@ static void record_full_step_stream(TkmRuntime *rt) {
                         dout, CUDA_R_16F, N_out, rt->d_col_ws, CUDA_R_16F, K,
                         rt->d_zero, rt->nstate[i].d_dW, CUDA_R_32F, N_out,
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                    CUBLAS_CHECK(cublasGemmEx(rt->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                        K, rows, N_out, rt->d_one,
-                        rt->nstate[i].d_W_h, CUDA_R_16F, N_out, dout, CUDA_R_16F, N_out,
-                        rt->d_zero, rt->d_col_ws, CUDA_R_16F, K,
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                    k_col2im_3x3_h<<<(elems + 255) / 256, 256, 0, rt->stream>>>(
-                        rt->d_col_ws, (__half*)din, B, in0->H, in0->W, in0->C);
+                    int needs_input_grad = !(in0->op == OP_INPUT || in0->cat == CAT_COORD);
+                    if (needs_input_grad) {
+                        CUBLAS_CHECK(cublasGemmEx(rt->cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            K, rows, N_out, rt->d_one,
+                            rt->nstate[i].d_W_h, CUDA_R_16F, N_out, dout, CUDA_R_16F, N_out,
+                            rt->d_zero, rt->d_col_ws, CUDA_R_16F, K,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                        k_col2im_3x3_h<<<(elems + 255) / 256, 256, 0, rt->stream>>>(
+                            rt->d_col_ws, (__half*)din, B, in0->H, in0->W, in0->C);
+                    }
                 }
                 break;
             }
@@ -1386,7 +1471,8 @@ float tkm_runtime_step(TkmRuntime *rt, const float *h_input, const uint8_t *h_la
 
     if (lr != rt->last_lr) {
         rt->last_lr = lr;
-        CUDA_CHECK(cudaMemcpyAsync(rt->d_lr, &lr, sizeof(float), cudaMemcpyHostToDevice, rt->stream));
+        *rt->h_pin_lr = lr;
+        CUDA_CHECK(cudaMemcpyAsync(rt->d_lr, rt->h_pin_lr, sizeof(float), cudaMemcpyHostToDevice, rt->stream));
     }
     if (h_input) {
         CUDA_CHECK(cudaMemcpyAsync(rt->d_input_f32, h_input, (size_t)in_elems * sizeof(float), cudaMemcpyHostToDevice, rt->stream));
@@ -1400,7 +1486,7 @@ float tkm_runtime_step(TkmRuntime *rt, const float *h_input, const uint8_t *h_la
     if (!rt->graph_captured) {
         CUDA_CHECK(cudaStreamSynchronize(rt->stream));
         CUDA_CHECK(cudaStreamBeginCapture(rt->stream, cudaStreamCaptureModeGlobal));
-        record_full_step_stream(rt);
+        record_full_step_stream(rt, 1);
         CUDA_CHECK(cudaStreamEndCapture(rt->stream, &rt->step_graph));
         CUDA_CHECK(cudaGraphInstantiate(&rt->step_exec, rt->step_graph, NULL, NULL, 0));
         rt->graph_captured = 1;
@@ -1411,8 +1497,9 @@ float tkm_runtime_step(TkmRuntime *rt, const float *h_input, const uint8_t *h_la
 
     float h_loss = 0.0f;
     if (h_input) {
-        CUDA_CHECK(cudaMemcpyAsync(&h_loss, rt->d_loss_buf, sizeof(float), cudaMemcpyDeviceToHost, rt->stream));
+        CUDA_CHECK(cudaMemcpyAsync(rt->h_pin_loss, rt->d_loss_buf, sizeof(float), cudaMemcpyDeviceToHost, rt->stream));
         CUDA_CHECK(cudaStreamSynchronize(rt->stream));
+        h_loss = *rt->h_pin_loss;
     }
     return h_loss;
 }
@@ -1691,6 +1778,181 @@ int tkm_runtime_train_dataset(TkmRuntime *rt, TkmDatasetNext next_batch,
     return result && batches > 0;
 }
 
+static float tkm_epoch_lr(float peak_lr, float min_lr_ratio, size_t step,
+                          size_t total_steps, size_t warmup_steps) {
+    float warmup = (warmup_steps > 0 && step < warmup_steps)
+        ? (float)(step + 1) / (float)warmup_steps : 1.0f;
+    float progress = total_steps > 1
+        ? fminf((float)step / (float)(total_steps - 1), 1.0f) : 1.0f;
+    float cosine = 0.5f * (1.0f + cosf(3.14159265358979323846f * progress));
+    return peak_lr * warmup * (min_lr_ratio + (1.0f - min_lr_ratio) * cosine);
+}
+
+TkmDataset *tkm_dataset_create(TkmRuntime *rt, const float *h_images,
+                               const uint8_t *h_labels, size_t num_samples) {
+    if (!rt || !rt->training_enabled || !h_images || !h_labels || num_samples == 0) return NULL;
+    TkmDataset *ds = (TkmDataset*)calloc(1, sizeof(*ds));
+    if (!ds) return NULL;
+    ds->rt = rt;
+    ds->h_images = h_images;
+    ds->h_labels = h_labels;
+    ds->num_samples = num_samples;
+    ds->sample_elems = (size_t)rt->graph.nodes[0].H * rt->graph.nodes[0].W * rt->graph.nodes[0].C;
+
+    if (num_samples > SIZE_MAX / ds->sample_elems ||
+        num_samples * ds->sample_elems > (size_t)INT_MAX) {
+        free(ds);
+        return NULL;
+    }
+    CUDA_CHECK(cudaMallocHost(&ds->h_pin_order, num_samples * sizeof(uint32_t)));
+    size_t fp16_bytes = num_samples * ds->sample_elems * sizeof(__half);
+    if (fp16_bytes <= SIZE_MAX - num_samples) fp16_bytes += num_samples;
+    size_t free_vram = 0, total_vram = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_vram, &total_vram));
+    ds->resident = fp16_bytes <= free_vram / 2;
+
+    if (ds->resident) {
+        __half *h_images_h = (__half*)malloc(num_samples * ds->sample_elems * sizeof(__half));
+        if (!h_images_h) { tkm_dataset_free(ds); return NULL; }
+        for (size_t i = 0; i < num_samples * ds->sample_elems; i++)
+            h_images_h[i] = __float2half(h_images[i]);
+        CUDA_CHECK(cudaMalloc(&ds->d_images_h, num_samples * ds->sample_elems * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&ds->d_labels_u8, num_samples * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMalloc(&ds->d_order, num_samples * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&ds->d_batch_idx, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&ds->d_global_step, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&ds->d_sched, sizeof(TkmSchedule)));
+        CUDA_CHECK(cudaMemcpy(ds->d_images_h, h_images_h,
+                              num_samples * ds->sample_elems * sizeof(__half),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ds->d_labels_u8, h_labels, num_samples * sizeof(uint8_t),
+                              cudaMemcpyHostToDevice));
+        free(h_images_h);
+
+        CUDA_CHECK(cudaStreamSynchronize(rt->stream));
+        CUDA_CHECK(cudaStreamBeginCapture(rt->stream, cudaStreamCaptureModeGlobal));
+        k_resident_gather_and_lr<<<256, 256, 0, rt->stream>>>(
+            ds->d_images_h, ds->d_labels_u8, ds->d_order,
+            (__half*)(rt->d_arena + rt->graph.nodes[0].out_offset), rt->d_labels,
+            rt->d_lr, ds->d_batch_idx, ds->d_global_step, ds->d_sched,
+            (int)ds->sample_elems, rt->graph.batch_size);
+        record_full_step_stream(rt, 0);
+        CUDA_CHECK(cudaStreamEndCapture(rt->stream, &ds->resident_graph));
+        CUDA_CHECK(cudaGraphInstantiate(&ds->resident_exec, ds->resident_graph, NULL, NULL, 0));
+    } else {
+        size_t in_bytes = (size_t)rt->graph.batch_size * ds->sample_elems * sizeof(float);
+        for (int slot = 0; slot < 2; slot++) {
+            CUDA_CHECK(cudaMallocHost(&ds->h_pin_in[slot], in_bytes));
+            CUDA_CHECK(cudaMallocHost(&ds->h_pin_lbl[slot], (size_t)rt->graph.batch_size * sizeof(uint8_t)));
+            CUDA_CHECK(cudaMallocHost(&ds->h_pin_lr[slot], sizeof(float)));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ds->slot_done[slot], cudaEventDisableTiming));
+            *ds->h_pin_lr[slot] = 0.0f;
+            CUDA_CHECK(cudaStreamSynchronize(rt->stream));
+            CUDA_CHECK(cudaStreamBeginCapture(rt->stream, cudaStreamCaptureModeGlobal));
+            CUDA_CHECK(cudaMemcpyAsync(rt->d_input_f32, ds->h_pin_in[slot], in_bytes,
+                                       cudaMemcpyHostToDevice, rt->stream));
+            CUDA_CHECK(cudaMemcpyAsync(rt->d_labels, ds->h_pin_lbl[slot],
+                                       (size_t)rt->graph.batch_size * sizeof(uint8_t),
+                                       cudaMemcpyHostToDevice, rt->stream));
+            CUDA_CHECK(cudaMemcpyAsync(rt->d_lr, ds->h_pin_lr[slot], sizeof(float),
+                                       cudaMemcpyHostToDevice, rt->stream));
+            k_f32_to_f16<<<((int)rt->graph.batch_size * (int)ds->sample_elems + 255) / 256,
+                           256, 0, rt->stream>>>(
+                rt->d_input_f32,
+                (__half*)(rt->d_arena + rt->graph.nodes[0].out_offset),
+                (int)((size_t)rt->graph.batch_size * ds->sample_elems));
+            record_full_step_stream(rt, 0);
+            CUDA_CHECK(cudaStreamEndCapture(rt->stream, &ds->stream_graph[slot]));
+            CUDA_CHECK(cudaGraphInstantiate(&ds->stream_exec[slot], ds->stream_graph[slot], NULL, NULL, 0));
+        }
+    }
+    ds->graphs_captured = 1;
+    return ds;
+}
+
+void tkm_dataset_free(TkmDataset *ds) {
+    if (!ds) return;
+    if (ds->resident_exec) cudaGraphExecDestroy(ds->resident_exec);
+    if (ds->resident_graph) cudaGraphDestroy(ds->resident_graph);
+    for (int slot = 0; slot < 2; slot++) {
+        if (ds->stream_exec[slot]) cudaGraphExecDestroy(ds->stream_exec[slot]);
+        if (ds->stream_graph[slot]) cudaGraphDestroy(ds->stream_graph[slot]);
+        if (ds->slot_done[slot]) cudaEventDestroy(ds->slot_done[slot]);
+        if (ds->h_pin_in[slot]) cudaFreeHost(ds->h_pin_in[slot]);
+        if (ds->h_pin_lbl[slot]) cudaFreeHost(ds->h_pin_lbl[slot]);
+        if (ds->h_pin_lr[slot]) cudaFreeHost(ds->h_pin_lr[slot]);
+    }
+    if (ds->d_images_h) cudaFree(ds->d_images_h);
+    if (ds->d_labels_u8) cudaFree(ds->d_labels_u8);
+    if (ds->d_order) cudaFree(ds->d_order);
+    if (ds->d_batch_idx) cudaFree(ds->d_batch_idx);
+    if (ds->d_global_step) cudaFree(ds->d_global_step);
+    if (ds->d_sched) cudaFree(ds->d_sched);
+    if (ds->h_pin_order) cudaFreeHost(ds->h_pin_order);
+    free(ds);
+}
+
+int tkm_dataset_is_resident(const TkmDataset *ds) {
+    return ds ? ds->resident : 0;
+}
+
+int tkm_runtime_train_epoch(TkmRuntime *rt, TkmDataset *ds,
+                            const uint32_t *h_order, float peak_lr,
+                            float min_lr_ratio, size_t global_step_start,
+                            size_t total_steps, size_t warmup_steps,
+                            float *out_average_loss) {
+    if (out_average_loss) *out_average_loss = 0.0f;
+    if (!rt || !ds || ds->rt != rt || !ds->graphs_captured ||
+        total_steps == 0 || peak_lr <= 0.0f || min_lr_ratio < 0.0f ||
+        min_lr_ratio > 1.0f) return 0;
+    size_t batch_size = (size_t)rt->graph.batch_size;
+    size_t full_batches = ds->num_samples / batch_size;
+    if (full_batches == 0 || global_step_start > UINT32_MAX ||
+        total_steps > UINT32_MAX || warmup_steps > UINT32_MAX) return 0;
+
+    if (h_order) memcpy(ds->h_pin_order, h_order, ds->num_samples * sizeof(uint32_t));
+    else for (size_t i = 0; i < ds->num_samples; i++) ds->h_pin_order[i] = (uint32_t)i;
+
+    CUDA_CHECK(cudaMemsetAsync(rt->d_loss_buf, 0, sizeof(float), rt->stream));
+    if (ds->resident) {
+        TkmSchedule sched = { peak_lr, min_lr_ratio, (uint32_t)total_steps, (uint32_t)warmup_steps };
+        CUDA_CHECK(cudaMemcpyAsync(ds->d_order, ds->h_pin_order,
+                                   ds->num_samples * sizeof(uint32_t),
+                                   cudaMemcpyHostToDevice, rt->stream));
+        uint32_t zero = 0, start = (uint32_t)global_step_start;
+        CUDA_CHECK(cudaMemcpyAsync(ds->d_batch_idx, &zero, sizeof(zero),
+                                   cudaMemcpyHostToDevice, rt->stream));
+        CUDA_CHECK(cudaMemcpyAsync(ds->d_global_step, &start, sizeof(start),
+                                   cudaMemcpyHostToDevice, rt->stream));
+        CUDA_CHECK(cudaMemcpyAsync(ds->d_sched, &sched, sizeof(sched),
+                                   cudaMemcpyHostToDevice, rt->stream));
+        for (size_t b = 0; b < full_batches; b++)
+            CUDA_CHECK(cudaGraphLaunch(ds->resident_exec, rt->stream));
+    } else {
+        size_t sample_bytes = ds->sample_elems * sizeof(float);
+        for (size_t b = 0; b < full_batches; b++) {
+            int slot = (int)(b & 1u);
+            if (b >= 2) CUDA_CHECK(cudaEventSynchronize(ds->slot_done[slot]));
+            for (size_t row = 0; row < batch_size; row++) {
+                uint32_t source = ds->h_pin_order[b * batch_size + row];
+                memcpy(ds->h_pin_in[slot] + row * ds->sample_elems,
+                       ds->h_images + (size_t)source * ds->sample_elems, sample_bytes);
+                ds->h_pin_lbl[slot][row] = ds->h_labels[source];
+            }
+            *ds->h_pin_lr[slot] = tkm_epoch_lr(peak_lr, min_lr_ratio,
+                                               global_step_start + b,
+                                               total_steps, warmup_steps);
+            CUDA_CHECK(cudaGraphLaunch(ds->stream_exec[slot], rt->stream));
+            CUDA_CHECK(cudaEventRecord(ds->slot_done[slot], rt->stream));
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(rt->h_pin_loss, rt->d_loss_buf, sizeof(float),
+                               cudaMemcpyDeviceToHost, rt->stream));
+    CUDA_CHECK(cudaStreamSynchronize(rt->stream));
+    if (out_average_loss) *out_average_loss = *rt->h_pin_loss / (float)full_batches;
+    return 1;
+}
+
 int tkm_runtime_eval_dataset(TkmRuntime *rt, TkmDatasetNext next_batch,
                              void *user, size_t max_batches,
                              int *out_correct, size_t *out_samples) {
@@ -1732,6 +1994,8 @@ void tkm_runtime_free(TkmRuntime *rt) {
     if (rt->d_labels)     cudaFree(rt->d_labels);
     if (rt->d_col_ws)     cudaFree(rt->d_col_ws);
     if (rt->d_cublas_ws)  cudaFree(rt->d_cublas_ws);
+    if (rt->h_pin_loss)   cudaFreeHost(rt->h_pin_loss);
+    if (rt->h_pin_lr)     cudaFreeHost(rt->h_pin_lr);
     for (int i = 0; i < TKM_MAX_NODES; i++) {
         NodeGpuState *st = &rt->nstate[i];
         if (st->d_W_master) cudaFree(st->d_W_master);

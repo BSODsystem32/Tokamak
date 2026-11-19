@@ -3,7 +3,7 @@
   <h1>⚡ Tokamak (tkm)</h1>
   <p><b>Bare-Metal Markup-to-CUDA Graph JIT Compiler & Deep Learning Engine</b></p>
   <p><i>Zero Python. Zero PyTorch. Zero LLVM. Pure C & NVRTC.</i></p>
-  <p><b>Current release: v4.0.1</b></p>
+  <p><b>Current release: v4.1.0</b></p>
 </div>
 
 ---
@@ -13,6 +13,15 @@
 **Tokamak (`tkm`)** is an ultra-lightweight, high-performance deep learning JIT compiler designed for researchers and hackers who want to build custom neural network architectures like puzzle blocks—**without being forced into the heavy Python / PyTorch / Triton ecosystem.**
 
 You write your model architecture in a clean `.tkm` markup DSL. Tokamak parses the computational DAG, automatically infers all tensor shapes, applies a two-pass peephole fusion optimizer (horizontal GEMM merge + vertical register confinement), and compiles the entire forward, backward, and optimizer pipeline into **native CUDA C++ via in-memory NVRTC**—finally launching as a **single, zero-CPU-overhead `cudaGraphExec_t`**.
+
+### v4.1.0 highlights
+
+Tokamak 4.1.0 adds a dataset-backed epoch API with automatic VRAM-resident
+FP16 batches and a pinned ping-pong CUDA Graph fallback. Dataset epochs keep
+batch preparation, forward, backward, SGD, and loss accumulation on the GPU
+graph path, with one loss readback per epoch. Sub-warp Plasma backward groups
+also use grid-stride replay with a capped backward grid to reduce L2 atomic
+contention.
 
 ### v4.0.1 highlights
 

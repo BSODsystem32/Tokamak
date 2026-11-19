@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     CIFAR_IMAGE_BYTES = 3072,
@@ -181,59 +182,63 @@ int main(int argc, char **argv) {
     size_t warmup_steps = total_steps / 10;
     if (warmup_steps > 500) warmup_steps = 500;
 
-    size_t *order = (size_t*)malloc(train.count * sizeof(*order));
-    float *batch_images = (float*)malloc((size_t)batch_size * CIFAR_IMAGE_BYTES * sizeof(*batch_images));
-    uint8_t *batch_labels = (uint8_t*)malloc((size_t)batch_size * sizeof(*batch_labels));
-    if (!order || !batch_images || !batch_labels) {
+    uint32_t *order = (uint32_t*)malloc(train.count * sizeof(*order));
+    if (!order) {
         fprintf(stderr, "Unable to allocate CIFAR-10 shuffle buffers.\n");
         free(order);
-        free(batch_images);
-        free(batch_labels);
         tkm_runtime_free(runtime);
         free_cifar_data(&train);
         free_cifar_data(&test);
         return 1;
     }
-    for (size_t i = 0; i < train.count; i++) order[i] = i;
+    for (size_t i = 0; i < train.count; i++) order[i] = (uint32_t)i;
+
+    TkmDataset *dataset = tkm_dataset_create(runtime, train.images, train.labels, train.count);
+    if (!dataset) {
+        fprintf(stderr, "Could not create the CUDA dataset.\n");
+        free(order);
+        tkm_runtime_free(runtime);
+        free_cifar_data(&train);
+        free_cifar_data(&test);
+        return 1;
+    }
+    printf("dataset mode: %s\n", tkm_dataset_is_resident(dataset) ? "Resident" : "Streaming");
 
     Pcg32 rng;
     pcg32_init(&rng, 0x4d595df4d0f33173ULL, 0x9e3779b97f4a7c15ULL);
 
     size_t step = 0;
+    clock_t train_begin = clock();
     for (int epoch = 0; epoch < epochs; epoch++) {
         for (size_t i = train.count; i > 1; i--) {
             uint32_t j = pcg32_bounded(&rng, (uint32_t)i);
-            size_t tmp = order[i - 1];
+            uint32_t tmp = order[i - 1];
             order[i - 1] = order[j];
             order[j] = tmp;
         }
-        float loss_sum = 0.0f;
-        for (size_t b = 0; b < full_batches; b++, step++) {
-            size_t start = b * (size_t)batch_size;
-            for (size_t row = 0; row < (size_t)batch_size; row++) {
-                size_t source = order[start + row];
-                memcpy(batch_images + row * CIFAR_IMAGE_BYTES,
-                       train.images + source * CIFAR_IMAGE_BYTES,
-                       CIFAR_IMAGE_BYTES * sizeof(*batch_images));
-                batch_labels[row] = train.labels[source];
-            }
-            float progress = total_steps > 1 ? (float)step / (float)(total_steps - 1) : 1.0f;
-            float warmup = (warmup_steps > 0 && step < warmup_steps)
-                ? (float)(step + 1) / (float)warmup_steps
-                : 1.0f;
-            float cosine = 0.5f * (1.0f + cosf(3.14159265359f * progress));
-            float lr = peak_lr * warmup * (0.05f + 0.95f * cosine);
-            loss_sum += tkm_runtime_step(runtime, batch_images, batch_labels, lr);
+        float loss = 0.0f;
+        if (!tkm_runtime_train_epoch(runtime, dataset, order, peak_lr, 0.05f,
+                                     step, total_steps, warmup_steps, &loss)) {
+            fprintf(stderr, "Training epoch %d failed.\n", epoch + 1);
+            tkm_dataset_free(dataset);
+            free(order);
+            tkm_runtime_free(runtime);
+            free_cifar_data(&train);
+            free_cifar_data(&test);
+            return 1;
         }
-        printf("epoch %d/%d: train loss %.4f\n", epoch + 1, epochs, loss_sum / (float)full_batches);
+        step += full_batches;
+        printf("epoch %d/%d: train loss %.4f\n", epoch + 1, epochs, loss);
     }
+    double elapsed = (double)(clock() - train_begin) / (double)CLOCKS_PER_SEC;
+    printf("training time: %.3f s (%.1f samples/sec)\n",
+           elapsed, elapsed > 0.0 ? (double)(full_batches * (size_t)batch_size * (size_t)epochs) / elapsed : 0.0);
 
     int correct = tkm_runtime_eval(runtime, test.images, test.labels, (int)test.count);
     printf("test accuracy: %d/%zu (%.2f%%)\n", correct, test.count,
            100.0 * (double)correct / (double)test.count);
+    tkm_dataset_free(dataset);
     free(order);
-    free(batch_images);
-    free(batch_labels);
     tkm_runtime_free(runtime);
     free_cifar_data(&train);
     free_cifar_data(&test);
