@@ -199,6 +199,155 @@ static float eval_scalar_bwd(TkmOpType op, float x, float w, float fval, float d
     }
 }
 
+static int conv_weight_tensor_index(const TkmGraph *g, int target_id) {
+    int tensor = 0;
+    for (int i = 0; i < g->num_nodes; i++) {
+        const TkmNode *n = &g->nodes[i];
+        if (n->C <= 0) continue;
+        if (n->op == OP_FC || n->op == OP_FC_TWIN_FUSED || n->op == OP_FC_QKV_FUSED ||
+            n->op == OP_CONV) {
+            if (i == target_id) return tensor;
+            tensor++;
+        }
+        const TkmOpSpec *spec = tkm_find_spec_by_node(n);
+        if (!spec) continue;
+        if (spec->res_flags & RES_PARAM_BIAS) tensor++;
+        if (spec->res_flags & RES_PARAM_WEIGHT) tensor++;
+        if (spec->res_flags & RES_PARAM_BETA) tensor++;
+    }
+    return -1;
+}
+
+static float *serialized_weight_tensor(uint8_t *buffer, int tensor_index, int *out_count) {
+    uint32_t count = 0;
+    memcpy(&count, buffer + sizeof(uint32_t), sizeof(count));
+    if (tensor_index < 0 || (uint32_t)tensor_index >= count) return NULL;
+    uint8_t *p = buffer + 2 * sizeof(uint32_t);
+    for (int i = 0; i < tensor_index; i++) {
+        uint32_t n = 0;
+        memcpy(&n, p, sizeof(n));
+        p += sizeof(n) + (size_t)n * sizeof(float);
+    }
+    uint32_t n = 0;
+    memcpy(&n, p, sizeof(n));
+    if (out_count) *out_count = (int)n;
+    return (float *)(p + sizeof(n));
+}
+
+static float conv_rel_error(float analytical, float numerical) {
+    return fabsf(analytical - numerical) /
+           fmaxf(1.0f, fmaxf(fabsf(analytical), fabsf(numerical)));
+}
+
+static int run_conv_numerical_check(void) {
+    static const char *tests[] = {
+        "input: 6x6x3\n"
+        "flow:\n"
+        "  c1: Conv(c=16, k=3, s=1, p=1) -> SiLU\n"
+        "  c2: Conv(c=16, k=3, s=1, p=1) -> AvgPool(2) -> Flatten -> FC(4) -> SoftmaxCE\n",
+        "input: 6x6x3\n"
+        "flow:\n"
+        "  c1: Conv(c=32, k=3, s=1, p=1) -> SiLU\n"
+        "  res: { b: Conv(c=32, k=3, s=1, p=1) -> SiLU, s: Identity } -> Add\n"
+        "  head: AvgPool(2) -> Flatten -> FC(4) -> SoftmaxCE\n"
+    };
+    const float eps = 5e-3f;
+    int failures = 0;
+
+    for (int test_id = 0; test_id < 2; test_id++) {
+        const int B = 2, input_elems = B * 6 * 6 * 3;
+        float *x = (float *)malloc((size_t)input_elems * sizeof(float));
+        uint8_t labels[2] = { 1, 2 };
+        if (!x) return 1;
+        for (int i = 0; i < input_elems; i++) x[i] = 0.15f * sinf((float)i * 0.37f) + 0.2f;
+
+        TkmGraph *graph = (TkmGraph *)calloc(1, sizeof(TkmGraph));
+        if (!graph) { free(x); return failures + 1; }
+        tkm_parse_dsl(graph, tests[test_id], B);
+        tkm_optimize_and_bind(graph);
+        tkm_plan_memory(graph);
+        char *cuda_src = tkm_codegen_cuda_string(graph);
+        TkmRuntime *rt_num = tkm_runtime_ignite(graph, cuda_src);
+        TkmRuntime *rt_ana = tkm_runtime_ignite(graph, cuda_src);
+        size_t weight_bytes = 0;
+        tkm_save_weights_buffer(rt_ana, NULL, 0, &weight_bytes);
+        uint8_t *initial = (uint8_t *)malloc(weight_bytes);
+        uint8_t *trial = (uint8_t *)malloc(weight_bytes);
+        uint8_t *updated = (uint8_t *)malloc(weight_bytes);
+        if (!initial || !trial || !updated ||
+            !tkm_save_weights_buffer(rt_ana, initial, weight_bytes, NULL)) {
+            failures++;
+            free(initial); free(trial); free(updated);
+            tkm_runtime_free(rt_num); tkm_runtime_free(rt_ana); free(cuda_src); free(x);
+            free(graph);
+            continue;
+        }
+
+        int conv_ids[2], conv_count = 0, silu_id = -1;
+        for (int i = 1; i < graph->num_nodes; i++) {
+            if (graph->nodes[i].op == OP_CONV && conv_count < 2) conv_ids[conv_count++] = i;
+            if (graph->nodes[i].op == OP_SILU && silu_id < 0) silu_id = i;
+        }
+
+        tkm_runtime_step(rt_ana, x, labels, 1e-2f);
+        if (!tkm_save_weights_buffer(rt_ana, updated, weight_bytes, NULL)) failures++;
+
+        float dx_ana = 0.0f;
+        int dx_idx = 7;
+        tkm_runtime_step(rt_num, x, labels, 0.0f);
+        if (silu_id >= 0) dx_ana = tkm_get_grad_sample(rt_num, silu_id, dx_idx);
+        tkm_perturb_tensor(rt_num, silu_id, dx_idx, eps);
+        float loss_p = tkm_eval_current_loss(rt_num);
+        tkm_perturb_tensor(rt_num, silu_id, dx_idx, -2.0f * eps);
+        float loss_m = tkm_eval_current_loss(rt_num);
+        tkm_perturb_tensor(rt_num, silu_id, dx_idx, eps);
+        float dx_num = (loss_p - loss_m) / (2.0f * eps);
+        float dx_err = conv_rel_error(dx_ana, dx_num);
+        printf("  [Conv dX]   Graph %c | Analytical: %+8.4f | Numerical: %+8.4f | RelErr: %.2e | %s\n",
+               'A' + test_id, dx_ana, dx_num, dx_err, dx_err <= 2e-2f ? "PASS" : "FAIL!");
+        if (dx_err > 2e-2f) failures++;
+
+        for (int c = 0; c < conv_count; c++) {
+            int tensor_id = conv_weight_tensor_index(graph, conv_ids[c]);
+            int nweights = 0;
+            float *old_w = serialized_weight_tensor(initial, tensor_id, &nweights);
+            float *new_w = serialized_weight_tensor(updated, tensor_id, NULL);
+            if (!old_w || !new_w || nweights <= 0) {
+                failures++;
+                continue;
+            }
+            int samples[2] = { nweights > 1 ? 1 : 0, nweights / 2 };
+            for (int s = 0; s < 2; s++) {
+                int wi = samples[s];
+                memcpy(trial, initial, weight_bytes);
+                float *trial_w = serialized_weight_tensor(trial, tensor_id, NULL);
+                trial_w[wi] += eps;
+                tkm_load_weights_buffer(rt_num, trial, weight_bytes);
+                float lp = tkm_runtime_step(rt_num, x, labels, 0.0f);
+                memcpy(trial, initial, weight_bytes);
+                trial_w = serialized_weight_tensor(trial, tensor_id, NULL);
+                trial_w[wi] -= eps;
+                tkm_load_weights_buffer(rt_num, trial, weight_bytes);
+                float lm = tkm_runtime_step(rt_num, x, labels, 0.0f);
+                float numerical = (lp - lm) / (2.0f * eps);
+                float analytical = (old_w[wi] - new_w[wi]) / (1.9f * 1e-2f) - 1e-4f * old_w[wi];
+                float err = conv_rel_error(analytical, numerical);
+                printf("  [Conv dW]   Graph %c Conv%d[%d] | Analytical: %+8.4f | Numerical: %+8.4f | RelErr: %.2e | %s\n",
+                       'A' + test_id, c + 1, wi, analytical, numerical, err, err <= 2e-2f ? "PASS" : "FAIL!");
+                if (err > 2e-2f) failures++;
+            }
+        }
+
+        free(initial); free(trial); free(updated);
+        tkm_runtime_free(rt_num);
+        tkm_runtime_free(rt_ana);
+        free(cuda_src);
+        free(graph);
+        free(x);
+    }
+    return failures;
+}
+
 static int run_numerical_calculus_check(void) {
     printf("=========================================================================================\n");
     printf("     TOKAMAK FINITE-DIFFERENCE NUMERICAL GRADIENT VERIFICATION (FIRST PRINCIPLES)        \n");
@@ -304,6 +453,7 @@ static int run_numerical_calculus_check(void) {
     }
 
     failed_ops += run_fused_user_fluid_check();
+    failed_ops += run_conv_numerical_check();
 
     printf("=========================================================================================\n");
     if (failed_ops == 0) {

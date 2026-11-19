@@ -78,7 +78,7 @@ Plasma operators, MixPool, and AvgPool use CUDA half2 kernels and require an eve
 
 | Category | Operator | Arguments & Defaults | Description |
 | :--- | :--- | :--- | :--- |
-| **Compute Anchors** | `Conv` | `c` (out channels), `k=3`, `s=1`, `p=0` | 2D Spatial Convolution (Direct Conv1 for $C_{in}=1$; Im2Col+GEMM for general) |
+| **Compute Anchors** | `Conv` | `c` (out channels), `k=3`, `s=1`, `p=0` | 2D Spatial Convolution; standard padded 3x3 uses direct shared-memory kernels for $1 \le C_{in} \le 4$, WMMA implicit GEMM when both channel counts are multiples of 16, and im2col+GEMM otherwise |
 | | `FC` | `c` / positional (out features) | Fully Connected Linear Layer (Tensor Core GEMM) |
 | | `GQA` | `q=8`, `kv=2`, `d=64`, `causal=false` | WMMA Tensor Core Grouped-Query FlashAttention-2 (`d=64` or `128`; set `causal=true` for decoder attention) |
 | **Spatial Transform** | `MixPool` | `k=2`, `ratio=0.85` | Mixed Anti-Aliased 2x2 Pooling: `ratio*Max + (1-ratio)*Avg` |

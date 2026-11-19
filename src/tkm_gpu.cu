@@ -189,64 +189,252 @@ void k_mixpool2x2_bwd_h2(const __half2 * __restrict__ dout, const uint16_t * __r
     base[o3] = __floats2half2_rn(p3.x + g.x * (mx == 3 ? pw : aw), p3.y + g.y * (my == 3 ? pw : aw));
 }
 
-__global__ __launch_bounds__(256, 4)
-void k_conv1_direct_c1_to_c32_fwd_h(const __half * __restrict__ in, const float * __restrict__ W,
-                                    __half * __restrict__ out, int N, int H, int W_dim) {
-    int n = blockIdx.x; if (n >= N) return;
-    int tid = threadIdx.x, c = tid & 31, sub = tid >> 5;
-    __shared__ float s_img[30][30];
-    for (int k = tid; k < 900; k += 256) s_img[k / 30][k % 30] = 0.0f;
-    __syncthreads();
-    const __half *img_in = in + (size_t)n * H * W_dim;
-    for (int pid = tid; pid < H * W_dim; pid += 256)
-        s_img[pid / W_dim + 1][pid % W_dim + 1] = __half2float(__ldg(&img_in[pid]));
-    __syncthreads();
+static __device__ __forceinline__ int conv_weight_index(int k, int ci, int co, int in_c, int out_c) {
+    return (k * in_c + ci) * out_c + co;
+}
 
-    float w0 = W[c*9+0], w1 = W[c*9+1], w2 = W[c*9+2];
-    float w3 = W[c*9+3], w4 = W[c*9+4], w5 = W[c*9+5];
-    float w6 = W[c*9+6], w7 = W[c*9+7], w8 = W[c*9+8];
-    __half *img_out = out + (size_t)n * H * W_dim * 32;
-    for (int pid = sub; pid < H * W_dim; pid += 8) {
-        int y = pid / W_dim, x = pid % W_dim;
-        float sum = s_img[y][x]*w0   + s_img[y][x+1]*w1   + s_img[y][x+2]*w2
-                  + s_img[y+1][x]*w3 + s_img[y+1][x+1]*w4 + s_img[y+1][x+2]*w5
-                  + s_img[y+2][x]*w6 + s_img[y+2][x+1]*w7 + s_img[y+2][x+2]*w8;
-        img_out[pid * 32 + c] = __float2half(sum);
+__global__ __launch_bounds__(256, 4)
+void k_conv_direct_small_cin_fwd_h(const __half * __restrict__ in, const __half * __restrict__ W,
+                                   __half * __restrict__ out, int N, int H, int W_dim,
+                                   int in_c, int out_c) {
+    int tiles_x = (W_dim + 15) / 16;
+    int tiles_y = (H + 15) / 16;
+    int tile = blockIdx.x;
+    int n = tile / (tiles_y * tiles_x);
+    if (n >= N) return;
+    int rem = tile % (tiles_y * tiles_x);
+    int by = rem / tiles_x, bx = rem % tiles_x;
+    int tid = threadIdx.x;
+    __shared__ float s_in[18][18][4];
+    for (int i = tid; i < 18 * 18 * in_c; i += blockDim.x) {
+        int ci = i % in_c, q = i / in_c;
+        int sy = q / 18, sx = q % 18;
+        int gy = by * 16 + sy - 1, gx = bx * 16 + sx - 1;
+        s_in[sy][sx][ci] = (gy >= 0 && gy < H && gx >= 0 && gx < W_dim)
+            ? __half2float(__ldg(&in[((size_t)n * H * W_dim + gy * W_dim + gx) * in_c + ci]))
+            : 0.0f;
+    }
+    __syncthreads();
+    int oy = by * 16 + tid / 16, ox = bx * 16 + tid % 16;
+    if (oy >= H || ox >= W_dim) return;
+    __half *dst = out + ((size_t)n * H * W_dim + oy * W_dim + ox) * out_c;
+    for (int co = 0; co < out_c; co++) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int ky = 0; ky < 3; ky++)
+            #pragma unroll
+            for (int kx = 0; kx < 3; kx++) {
+                int k = ky * 3 + kx;
+                for (int ci = 0; ci < in_c; ci++)
+                    sum = fmaf(s_in[oy - by * 16 + ky + 1][ox - bx * 16 + kx + 1][ci],
+                               __half2float(__ldg(&W[conv_weight_index(k, ci, co, in_c, out_c)])), sum);
+            }
+        dst[co] = __float2half(sum);
     }
 }
 
 __global__ __launch_bounds__(256, 4)
-void k_conv1_direct_c1_to_c32_dW_h(const __half * __restrict__ in, const __half * __restrict__ dout,
-                                   float * __restrict__ dW, int N, int H, int W_dim) {
-    int n = blockIdx.x; if (n >= N) return;
-    int tid = threadIdx.x, c = tid & 31, sub = tid >> 5;
-    __shared__ float s_img[30][30];
-    for (int k = tid; k < 900; k += 256) s_img[k / 30][k % 30] = 0.0f;
-    __syncthreads();
-    const __half *img_in = in + (size_t)n * H * W_dim;
-    for (int pid = tid; pid < H * W_dim; pid += 256)
-        s_img[pid / W_dim + 1][pid % W_dim + 1] = __half2float(__ldg(&img_in[pid]));
-    __syncthreads();
-
-    float dw[9] = {0,0,0,0,0,0,0,0,0};
-    const __half *dout_n = dout + (size_t)n * H * W_dim * 32;
-    for (int pid = sub; pid < H * W_dim; pid += 8) {
-        int y = pid / W_dim, x = pid % W_dim;
-        float dy = __half2float(__ldg(&dout_n[pid * 32 + c]));
-        dw[0] = fmaf(dy, s_img[y][x],     dw[0]); dw[1] = fmaf(dy, s_img[y][x+1],   dw[1]); dw[2] = fmaf(dy, s_img[y][x+2],   dw[2]);
-        dw[3] = fmaf(dy, s_img[y+1][x],   dw[3]); dw[4] = fmaf(dy, s_img[y+1][x+1], dw[4]); dw[5] = fmaf(dy, s_img[y+1][x+2], dw[5]);
-        dw[6] = fmaf(dy, s_img[y+2][x],   dw[6]); dw[7] = fmaf(dy, s_img[y+2][x+1], dw[7]); dw[8] = fmaf(dy, s_img[y+2][x+2], dw[8]);
-    }
-    __shared__ float s_dw[8][9][33];
-    for (int k = 0; k < 9; k++) s_dw[sub][k][c] = dw[k];
-    __syncthreads();
-    if (sub == 0) {
-        for (int k = 0; k < 9; k++) {
-            float sum = s_dw[0][k][c]+s_dw[1][k][c]+s_dw[2][k][c]+s_dw[3][k][c]
-                      + s_dw[4][k][c]+s_dw[5][k][c]+s_dw[6][k][c]+s_dw[7][k][c];
-            atomicAdd(&dW[c * 9 + k], sum);
+void k_conv_direct_small_cin_dX_h(const __half * __restrict__ dout, const __half * __restrict__ W,
+                                  __half * __restrict__ din, int N, int H, int W_dim,
+                                  int in_c, int out_c) {
+    int total = N * H * W_dim * in_c;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int ci = idx % in_c, q = idx / in_c, x = q % W_dim, t = q / W_dim, y = t % H, n = t / H;
+    float sum = 0.0f;
+    for (int ky = -1; ky <= 1; ky++) {
+        int oy = y - ky;
+        if (oy < 0 || oy >= H) continue;
+        for (int kx = -1; kx <= 1; kx++) {
+            int ox = x - kx;
+            if (ox < 0 || ox >= W_dim) continue;
+            int k = (ky + 1) * 3 + (kx + 1);
+            const __half *dy = dout + ((size_t)n * H * W_dim + oy * W_dim + ox) * out_c;
+            for (int co = 0; co < out_c; co++)
+                sum = fmaf(__half2float(__ldg(&dy[co])),
+                           __half2float(__ldg(&W[conv_weight_index(k, ci, co, in_c, out_c)])), sum);
         }
     }
+    din[idx] = __float2half(__half2float(din[idx]) + sum);
+}
+
+__global__ __launch_bounds__(256, 4)
+void k_conv_direct_small_cin_dW_h(const __half * __restrict__ in, const __half * __restrict__ dout,
+                                  float * __restrict__ dW, int N, int H, int W_dim,
+                                  int in_c, int out_c) {
+    int total = 9 * in_c * out_c;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int co = idx % out_c, q = idx / out_c, ci = q % in_c, k = q / in_c;
+    int ky = k / 3 - 1, kx = k % 3 - 1;
+    float sum = 0.0f;
+    for (int n = 0; n < N; n++)
+        for (int y = 0; y < H; y++) {
+            int iy = y + ky;
+            if (iy < 0 || iy >= H) continue;
+            for (int x = 0; x < W_dim; x++) {
+                int ix = x + kx;
+                if (ix < 0 || ix >= W_dim) continue;
+                float xv = __half2float(__ldg(&in[((size_t)n * H * W_dim + iy * W_dim + ix) * in_c + ci]));
+                float dy = __half2float(__ldg(&dout[((size_t)n * H * W_dim + y * W_dim + x) * out_c + co]));
+                sum = fmaf(xv, dy, sum);
+            }
+        }
+    dW[idx] = sum;
+}
+
+static __device__ __forceinline__ void conv_decode_row(int row, int H, int W, int *n, int *y, int *x) {
+    *x = row % W;
+    int q = row / W;
+    *y = q % H;
+    *n = q / H;
+}
+
+template<int BN>
+__global__ void k_conv3x3_wmma_fwd_h(const __half * __restrict__ in, const __half * __restrict__ W,
+                                     __half * __restrict__ out, int rows, int H, int W_dim,
+                                     int in_c, int out_c) {
+    constexpr int WARPS = BN / 16;
+    int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (warp >= WARPS) return;
+    int row0 = (int)blockIdx.x * 16, co0 = (int)blockIdx.y * BN + warp * 16;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+    __shared__ __half s_a[16][16], s_b[WARPS][16][16];
+    for (int ky = -1; ky <= 1; ky++)
+        for (int kx = -1; kx <= 1; kx++) {
+            int k = (ky + 1) * 3 + (kx + 1);
+            for (int ci0 = 0; ci0 < in_c; ci0 += 16) {
+                for (int j = threadIdx.x; j < 256; j += blockDim.x) {
+                    int r = j / 16, c = j % 16;
+                    int n, y, x;
+                    conv_decode_row(row0 + r, H, W_dim, &n, &y, &x);
+                    int gy = y + ky, gx = x + kx;
+                    s_a[r][c] = (row0 + r < rows && gy >= 0 && gy < H && gx >= 0 && gx < W_dim)
+                        ? __ldg(&in[((size_t)n * H * W_dim + gy * W_dim + gx) * in_c + ci0 + c])
+                        : __float2half(0.0f);
+                }
+                for (int j = lane; j < 256; j += 32) {
+                    int r = j / 16, c = j % 16;
+                    s_b[warp][r][c] = __ldg(&W[((k * in_c + ci0 + r) * out_c) + co0 + c]);
+                }
+                __syncthreads();
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb;
+                wmma::load_matrix_sync(fa, &s_a[0][0], 16);
+                wmma::load_matrix_sync(fb, &s_b[warp][0][0], 16);
+                wmma::mma_sync(acc, fa, fb, acc);
+                __syncthreads();
+            }
+        }
+    __shared__ float s_out[WARPS][16][16];
+    wmma::store_matrix_sync(&s_out[warp][0][0], acc, 16, wmma::mem_row_major);
+    __syncthreads();
+    for (int j = lane; j < 256; j += 32) {
+        int r = j / 16, c = j % 16;
+        if (row0 + r < rows && co0 + c < out_c) {
+            int n, y, x;
+            conv_decode_row(row0 + r, H, W_dim, &n, &y, &x);
+            out[((size_t)n * H * W_dim + y * W_dim + x) * out_c + co0 + c] =
+                __float2half(s_out[warp][r][c]);
+        }
+    }
+}
+
+__global__ void k_conv3x3_wmma_dX_h(const __half * __restrict__ dout, const __half * __restrict__ W,
+                                    __half * __restrict__ din, int rows, int H, int W_dim,
+                                    int in_c, int out_c) {
+    int row0 = (int)blockIdx.x * 16, ci0 = (int)blockIdx.y * 16, lane = threadIdx.x & 31;
+    if (threadIdx.x >= 32) return;
+    __shared__ __half s_a[16][16], s_b[16][16];
+    __shared__ float s_acc[16][16], s_tmp[16][16];
+    for (int j = lane; j < 256; j += 32) s_acc[j / 16][j % 16] = 0.0f;
+    __syncthreads();
+    for (int ky = -1; ky <= 1; ky++)
+        for (int kx = -1; kx <= 1; kx++) {
+            int k = (ky + 1) * 3 + (kx + 1);
+            for (int co0 = 0; co0 < out_c; co0 += 16) {
+                for (int j = lane; j < 256; j += 32) {
+                    int r = j / 16, c = j % 16, n, y, x;
+                    conv_decode_row(row0 + r, H, W_dim, &n, &y, &x);
+                    int oy = y - ky, ox = x - kx;
+                    s_a[r][c] = (row0 + r < rows && oy >= 0 && oy < H && ox >= 0 && ox < W_dim)
+                        ? dout[((size_t)n * H * W_dim + oy * W_dim + ox) * out_c + co0 + c]
+                        : __float2half(0.0f);
+                    s_b[c][r] = __ldg(&W[((k * in_c + ci0 + r) * out_c) + co0 + c]);
+                }
+                __syncthreads();
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc;
+                wmma::fill_fragment(fc, 0.0f);
+                wmma::load_matrix_sync(fa, &s_a[0][0], 16);
+                wmma::load_matrix_sync(fb, &s_b[0][0], 16);
+                wmma::mma_sync(fc, fa, fb, fc);
+                wmma::store_matrix_sync(&s_tmp[0][0], fc, 16, wmma::mem_row_major);
+                __syncthreads();
+                for (int j = lane; j < 256; j += 32) s_acc[j / 16][j % 16] += s_tmp[j / 16][j % 16];
+                __syncthreads();
+            }
+        }
+    for (int j = lane; j < 256; j += 32) {
+        int r = j / 16, c = j % 16;
+        if (row0 + r < rows && ci0 + c < in_c) {
+            int n, y, x;
+            conv_decode_row(row0 + r, H, W_dim, &n, &y, &x);
+            size_t idx = ((size_t)n * H * W_dim + y * W_dim + x) * in_c + ci0 + c;
+            din[idx] = __float2half(__half2float(din[idx]) + s_acc[r][c]);
+        }
+    }
+}
+
+__global__ void k_conv3x3_wmma_dW_h(const __half * __restrict__ in, const __half * __restrict__ dout,
+                                    float * __restrict__ dW, int rows, int H, int W_dim,
+                                    int in_c, int out_c, int split_k) {
+    int tile = (int)blockIdx.x;
+    int ci0 = (tile % (in_c / 16)) * 16, co0 = (tile / (in_c / 16)) * 16;
+    int k = (int)blockIdx.y, split = (int)blockIdx.z, lane = threadIdx.x & 31;
+    int ky = k / 3 - 1, kx = k % 3 - 1;
+    int start = (rows * split) / split_k, end = (rows * (split + 1)) / split_k;
+    __shared__ __half s_a[16][16], s_b[16][16];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+    for (int row = start; row < end; row += 16) {
+        for (int j = lane; j < 256; j += 32) {
+            int r = j / 16, c = j % 16, n, y, x;
+            conv_decode_row(row + r, H, W_dim, &n, &y, &x);
+            int iy = y + ky, ix = x + kx;
+            s_a[r][c] = (row + r < end && row + r < rows && iy >= 0 && iy < H && ix >= 0 && ix < W_dim)
+                ? __ldg(&in[((size_t)n * H * W_dim + iy * W_dim + ix) * in_c + ci0 + c])
+                : __float2half(0.0f);
+            s_b[r][c] = (row + r < end && row + r < rows)
+                ? __ldg(&dout[((size_t)n * H * W_dim + y * W_dim + x) * out_c + co0 + c])
+                : __float2half(0.0f);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::col_major> fa;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb;
+        wmma::load_matrix_sync(fa, &s_a[0][0], 16);
+        wmma::load_matrix_sync(fb, &s_b[0][0], 16);
+        wmma::mma_sync(acc, fa, fb, acc);
+        __syncthreads();
+    }
+    __shared__ float s_dw[16][16];
+    wmma::store_matrix_sync(&s_dw[0][0], acc, 16, wmma::mem_row_major);
+    __syncthreads();
+    for (int j = lane; j < 256; j += 32) {
+        int r = j / 16, c = j % 16;
+        if (ci0 + r < in_c && co0 + c < out_c)
+            atomicAdd(&dW[((size_t)k * in_c + ci0 + r) * out_c + co0 + c], s_dw[r][c]);
+    }
+}
+
+static int conv_uses_direct(int in_c, int k, int s, int p) {
+    return k == 3 && s == 1 && p == 1 && in_c >= 1 && in_c <= 4;
+}
+
+static int conv_uses_wmma(int in_c, int out_c, int k, int s, int p) {
+    return k == 3 && s == 1 && p == 1 && (in_c % 16 == 0) && (out_c % 16 == 0);
 }
 
 __global__ __launch_bounds__(256, 4)
@@ -894,6 +1082,7 @@ struct TkmRuntime {
     cudaGraphExec_t step_exec;
     int             graph_captured;
     float           last_lr;
+    int             eval_start_node;
 
     NodeGpuState    nstate[TKM_MAX_NODES];
 };
@@ -1093,6 +1282,9 @@ static TkmRuntime *tkm_runtime_ignite_mode(const TkmGraph *g, const char *cuda_s
     for (int i = 0; i < g->num_nodes; i++) {
         if (!g->nodes[i].dead && g->nodes[i].op == OP_CONV) {
             const TkmNode *in0 = &g->nodes[g->nodes[i].in0];
+            if (conv_uses_direct(in0->C, g->nodes[i].k, g->nodes[i].s, g->nodes[i].p) ||
+                conv_uses_wmma(in0->C, g->nodes[i].C, g->nodes[i].k, g->nodes[i].s, g->nodes[i].p))
+                continue;
             size_t csz = (size_t)g->batch_size * in0->H * in0->W * 9 * in0->C;
             if (csz > max_col) max_col = csz;
         }
@@ -1181,11 +1373,15 @@ static void execute_forward_pass(TkmRuntime *rt, int is_eval, int valid_examples
     for (int i = 1; i < g->num_nodes; i++) {
         const TkmNode *n = &g->nodes[i];
         if (n->dead) continue;
+        if (rt->eval_start_node >= 0 && i <= rt->eval_start_node) continue;
 
         if (n->plasma_grp >= 0) {
             int gid = n->plasma_grp;
             if (!executed_grp[gid]) {
                 executed_grp[gid] = 1;
+                if (rt->eval_start_node >= 0 &&
+                    g->groups[gid].anchor_id <= rt->eval_start_node)
+                    continue;
                 if (is_eval && g->groups[gid].is_coord_group) {
                     const TkmNode *in0 = &g->nodes[g->groups[gid].anchor_id];
                     const TkmNode *out = &g->nodes[g->groups[gid].out_node_id];
@@ -1218,9 +1414,22 @@ static void execute_forward_pass(TkmRuntime *rt, int is_eval, int valid_examples
             }
             case OP_CONV: {
                 const TkmNode *in0 = &g->nodes[n->in0];
-                if (in0->C == 1 && n->C == 32 && in0->H == 28 && in0->W == 28) {
-                    k_conv1_direct_c1_to_c32_fwd_h<<<B, 256, 0, rt->stream>>>(
-                        (const __half*)in_ptr, rt->nstate[i].d_W_master, (__half*)out_ptr, B, in0->H, in0->W);
+                if (conv_uses_direct(in0->C, n->k, n->s, n->p)) {
+                    int tiles = B * ((in0->H + 15) / 16) * ((in0->W + 15) / 16);
+                    k_conv_direct_small_cin_fwd_h<<<tiles, 256, 0, rt->stream>>>(
+                        (const __half*)in_ptr, rt->nstate[i].d_W_h, (__half*)out_ptr,
+                        B, in0->H, in0->W, in0->C, n->C);
+                } else if (conv_uses_wmma(in0->C, n->C, n->k, n->s, n->p)) {
+                    int bn = (n->C % 32 == 0) ? 32 : 16;
+                    dim3 grid((rows + 15) / 16, (n->C + bn - 1) / bn);
+                    if (bn == 32)
+                        k_conv3x3_wmma_fwd_h<32><<<grid, 64, 0, rt->stream>>>(
+                            (const __half*)in_ptr, rt->nstate[i].d_W_h, (__half*)out_ptr,
+                            rows, in0->H, in0->W, in0->C, n->C);
+                    else
+                        k_conv3x3_wmma_fwd_h<16><<<grid, 32, 0, rt->stream>>>(
+                            (const __half*)in_ptr, rt->nstate[i].d_W_h, (__half*)out_ptr,
+                            rows, in0->H, in0->W, in0->C, n->C);
                 } else {
                     int elems = B * in0->H * in0->W * in0->C;
                     k_im2col_3x3_h<<<(elems + 255) / 256, 256, 0, rt->stream>>>(
@@ -1345,10 +1554,37 @@ static void record_full_step_stream(TkmRuntime *rt, int clear_loss) {
             }
             case OP_CONV: {
                 const TkmNode *in0 = &g->nodes[n->in0];
-                if (in0->C == 1 && n->C == 32 && in0->H == 28 && in0->W == 28) {
-                    CUDA_CHECK(cudaMemsetAsync(rt->nstate[i].d_dW, 0, 9 * 32 * sizeof(float), rt->stream));
-                    k_conv1_direct_c1_to_c32_dW_h<<<B, 256, 0, rt->stream>>>(
-                        (const __half*)in_act, (const __half*)dout, rt->nstate[i].d_dW, B, in0->H, in0->W);
+                if (conv_uses_direct(in0->C, n->k, n->s, n->p)) {
+                    CUDA_CHECK(cudaMemsetAsync(rt->nstate[i].d_dW, 0,
+                                               (size_t)9 * in0->C * n->C * sizeof(float), rt->stream));
+                    int total_dw = 9 * in0->C * n->C;
+                    k_conv_direct_small_cin_dW_h<<<(total_dw + 255) / 256, 256, 0, rt->stream>>>(
+                        (const __half*)in_act, (const __half*)dout, rt->nstate[i].d_dW,
+                        B, in0->H, in0->W, in0->C, n->C);
+                    int needs_input_grad = !(in0->op == OP_INPUT || in0->cat == CAT_COORD);
+                    if (needs_input_grad) {
+                        int elems = B * in0->H * in0->W * in0->C;
+                        k_conv_direct_small_cin_dX_h<<<(elems + 255) / 256, 256, 0, rt->stream>>>(
+                            (const __half*)dout, rt->nstate[i].d_W_h, (__half*)din,
+                            B, in0->H, in0->W, in0->C, n->C);
+                    }
+                } else if (conv_uses_wmma(in0->C, n->C, n->k, n->s, n->p)) {
+                    CUDA_CHECK(cudaMemsetAsync(rt->nstate[i].d_dW, 0,
+                                               (size_t)9 * in0->C * n->C * sizeof(float), rt->stream));
+                    int split_k = (rows + 255) / 256;
+                    if (split_k < 1) split_k = 1;
+                    if (split_k > 32) split_k = 32;
+                    dim3 grid((in0->C / 16) * (n->C / 16), 9, split_k);
+                    k_conv3x3_wmma_dW_h<<<grid, 32, 0, rt->stream>>>(
+                        (const __half*)in_act, (const __half*)dout, rt->nstate[i].d_dW,
+                        rows, in0->H, in0->W, in0->C, n->C, split_k);
+                    int needs_input_grad = !(in0->op == OP_INPUT || in0->cat == CAT_COORD);
+                    if (needs_input_grad) {
+                        dim3 dx_grid((rows + 15) / 16, in0->C / 16);
+                        k_conv3x3_wmma_dX_h<<<dx_grid, 32, 0, rt->stream>>>(
+                            (const __half*)dout, rt->nstate[i].d_W_h, (__half*)din,
+                            rows, in0->H, in0->W, in0->C, n->C);
+                    }
                 } else {
                     int elems = B * in0->H * in0->W * in0->C;
                     k_im2col_3x3_h<<<(elems + 255) / 256, 256, 0, rt->stream>>>(
@@ -1478,6 +1714,7 @@ TkmRuntime *tkm_load_file(const char *tkm_path, int batch_size) {
 }
 
 float tkm_runtime_step(TkmRuntime *rt, const float *h_input, const uint8_t *h_labels, float lr) {
+    rt->eval_start_node = -1;
     int B = rt->graph.batch_size;
     int in_elems = B * rt->graph.nodes[0].H * rt->graph.nodes[0].W * rt->graph.nodes[0].C;
 
@@ -1576,6 +1813,7 @@ float tkm_eval_current_loss(TkmRuntime *rt) {
     float l = 0.0f;
     CUDA_CHECK(cudaMemcpyAsync(&l, rt->d_loss_buf, sizeof(float), cudaMemcpyDeviceToHost, rt->stream));
     CUDA_CHECK(cudaStreamSynchronize(rt->stream));
+    rt->eval_start_node = -1;
     return l;
 }
 
@@ -1585,6 +1823,7 @@ void tkm_perturb_tensor(TkmRuntime *rt, int node_id, int elem_idx, float delta) 
     __half *ptr = (__half*)(rt->d_arena + n->out_offset);
     k_perturb_f16<<<1, 1, 0, rt->stream>>>(ptr, elem_idx, delta);
     CUDA_CHECK(cudaStreamSynchronize(rt->stream));
+    rt->eval_start_node = node_id;
 }
 
 /* Sample analytical gradient of element idx from grad_arena */
