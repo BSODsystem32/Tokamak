@@ -96,6 +96,10 @@ GPU allocations and generated CUDA state. The caller owns:
 - the `user` object passed to a `TkmDatasetNext` callback;
 - strings and file paths passed to path-based APIs.
 
+`tkm_dataset_create` creates a dataset view over caller-owned NHWC float images
+and one `uint8_t` label per sample. Keep the image and label arrays alive until
+`tkm_dataset_free`. Destroy datasets before destroying their runtime.
+
 The caller may release or reuse input buffers after the API call returns.
 Callbacks are invoked synchronously and must not retain Tokamak's temporary
 input or label pointers after returning.
@@ -189,6 +193,35 @@ entering the runtime.
 All functions in this section are declared with `TKM_API`.
 
 ### 6.1 Runtime creation
+
+### 6.2 CUDA-graph dataset epochs
+
+```c
+typedef struct TkmDataset TkmDataset;
+
+TkmDataset *tkm_dataset_create(TkmRuntime *rt,
+                               const float *h_images,
+                               const uint8_t *h_labels,
+                               size_t num_samples);
+void tkm_dataset_free(TkmDataset *dataset);
+int tkm_dataset_is_resident(const TkmDataset *dataset);
+int tkm_runtime_train_epoch(TkmRuntime *rt, TkmDataset *dataset,
+                            const uint32_t *h_order, float peak_lr,
+                            float min_lr_ratio, size_t global_step_start,
+                            size_t total_steps, size_t warmup_steps,
+                            float *out_average_loss);
+```
+
+The dataset is bound to the runtime input shape. If its FP16 image storage
+fits within half of currently free VRAM, creation selects Resident mode and
+uploads the dataset once. Otherwise it selects Streaming mode and captures
+two pinned host staging graphs. `h_order` is optional; `NULL` uses sequential
+sample order. Only complete runtime-sized batches are processed.
+
+The epoch API computes a linear-warmup/cosine learning-rate schedule and
+returns the average accumulated loss after one host synchronization at epoch
+end. The image, label, and order buffers remain caller-owned; the dataset
+must be freed before its runtime.
 
 #### `tkm_runtime_ignite`
 

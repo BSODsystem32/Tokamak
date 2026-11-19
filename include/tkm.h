@@ -215,6 +215,7 @@ TKM_API char *tkm_codegen_cuda_string(const TkmGraph *g);
    5. Public High-Level Engine C API (For External C / C++ / Python Callers)
    ========================================================================= */
 typedef struct TkmRuntime TkmRuntime;
+typedef struct TkmDataset TkmDataset;
 
 /*
  * Fill up to `capacity` samples into the supplied host buffers.
@@ -239,6 +240,21 @@ TKM_API size_t      tkm_runtime_weight_bytes(const TkmRuntime *rt);
 TKM_API int         tkm_runtime_train_dataset(TkmRuntime *rt, TkmDatasetNext next_batch,
                                                void *user, size_t max_batches, float lr,
                                                float *out_average_loss);
+TKM_API TkmDataset *tkm_dataset_create(TkmRuntime *rt,
+                                       const float *h_images,
+                                       const uint8_t *h_labels,
+                                       size_t num_samples);
+TKM_API void        tkm_dataset_free(TkmDataset *ds);
+TKM_API int         tkm_dataset_is_resident(const TkmDataset *ds);
+TKM_API int         tkm_runtime_train_epoch(TkmRuntime *rt,
+                                            TkmDataset *ds,
+                                            const uint32_t *h_order,
+                                            float peak_lr,
+                                            float min_lr_ratio,
+                                            size_t global_step_start,
+                                            size_t total_steps,
+                                            size_t warmup_steps,
+                                            float *out_average_loss);
 TKM_API int         tkm_runtime_eval_dataset(TkmRuntime *rt, TkmDatasetNext next_batch,
                                               void *user, size_t max_batches,
                                               int *out_correct, size_t *out_samples);

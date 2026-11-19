@@ -357,7 +357,10 @@ static void build_group_abi(const TkmGraph *g, PlasmaGroup *pg) {
     int rows = g->batch_size * pg->H * pg->W;
     int C2 = pg->C / 2;
     int rows_per_blk = (!pg->is_qkv_prep && C2 > 0 && C2 <= 32 && (256 % C2 == 0)) ? (256 / C2) : TKM_ROWS_PER_CTA;
-    fs->grid_x  = bs->grid_x  = (rows + rows_per_blk - 1) / rows_per_blk;
+    fs->grid_x  = (rows + rows_per_blk - 1) / rows_per_blk;
+    bs->grid_x  = (rows + rows_per_blk - 1) / rows_per_blk;
+    if (!pg->is_qkv_prep && C2 > 0 && C2 <= 32 && (256 % C2 == 0) && bs->grid_x > 256)
+        bs->grid_x = 256;
     fs->block_x = bs->block_x = 256;
 
     add_karg(fs, KARG_IN_MAIN,   pg->anchor_id,   0, "const __half2* __restrict__", "in_0");
