@@ -249,12 +249,16 @@ static int run_conv_numerical_check(void) {
         "flow:\n"
         "  c1: Conv(c=32, k=3, s=1, p=1) -> SiLU\n"
         "  res: { b: Conv(c=32, k=3, s=1, p=1) -> SiLU, s: Identity } -> Add\n"
-        "  head: AvgPool(2) -> Flatten -> FC(4) -> SoftmaxCE\n"
+        "  head: AvgPool(2) -> Flatten -> FC(4) -> SoftmaxCE\n",
+        "input: 6x6x3\n"
+        "flow:\n"
+        "  c1: Conv(c=16, k=1, s=1, p=0) -> SiLU\n"
+        "  c2: Conv(c=16, k=3, s=2, p=1) -> Flatten -> FC(4) -> SoftmaxCE\n"
     };
     const float eps = 5e-3f;
     int failures = 0;
 
-    for (int test_id = 0; test_id < 2; test_id++) {
+    for (int test_id = 0; test_id < 3; test_id++) {
         const int B = 2, input_elems = B * 6 * 6 * 3;
         float *x = (float *)malloc((size_t)input_elems * sizeof(float));
         uint8_t labels[2] = { 1, 2 };
